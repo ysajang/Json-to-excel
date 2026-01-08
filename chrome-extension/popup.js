@@ -1,13 +1,7 @@
 // DOM 요소
-console.log('[Popup] ========== Popup Script 초기화 시작 ==========');
 const productUrlInput = document.getElementById('productUrl');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
-
-console.log('[Popup] DOM 요소 확인:');
-console.log('[Popup] - productUrlInput:', productUrlInput ? '✅' : '❌');
-console.log('[Popup] - startBtn:', startBtn ? '✅' : '❌');
-console.log('[Popup] - stopBtn:', stopBtn ? '✅' : '❌');
 const statusDiv = document.getElementById('status');
 const progressDiv = document.getElementById('progress');
 const progressFill = document.getElementById('progressFill');
@@ -57,57 +51,35 @@ function loadLogsFromStorage() {
 async function loadCurrentPageUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab) {
+    if (tab && tab.url) {
       // 탭 ID 저장
       currentTabId = tab.id;
-      console.log('[자동 URL 추출] 현재 탭 ID:', currentTabId);
 
-      if (tab.url && tab.url.includes('coupang.com/vp/products/')) {
-        productUrlInput.value = tab.url;
-        console.log('[자동 URL 추출] 현재 페이지 URL 설정:', tab.url);
-      } else {
-        console.log('[자동 URL 추출] 쿠팡 상품 페이지가 아님:', tab.url);
-        // 쿠팡 상품 페이지가 아니어도 입력 필드는 비워두고 사용자가 직접 입력할 수 있도록 함
-      }
+      // 항상 현재 탭의 URL을 설정
+      productUrlInput.value = tab.url;
+
+      // URL input을 disabled 처리
+      productUrlInput.disabled = true;
     }
   } catch (error) {
-    console.error('[자동 URL 추출] 오류:', error);
+    // 오류 처리
   }
 }
 
 // 리뷰 수집 시작
-console.log('[Popup] 시작 버튼 이벤트 리스너 등록 중...');
-if (!startBtn) {
-  console.error('[Popup] ❌ 시작 버튼을 찾을 수 없습니다!');
-  console.error('[Popup] DOM이 완전히 로드되지 않았을 수 있습니다.');
-} else {
-  console.log('[Popup] ✅ 시작 버튼 찾음');
-  console.log('[Popup] 시작 버튼 ID:', startBtn.id);
-  console.log('[Popup] 시작 버튼 클래스:', startBtn.className);
-  console.log('[Popup] 시작 버튼 텍스트:', startBtn.textContent);
-  console.log('[Popup] 시작 버튼 disabled:', startBtn.disabled);
-}
-
 if (startBtn) {
   startBtn.addEventListener('click', async () => {
-    console.log('[Popup] ========== 시작 버튼 클릭 ==========');
-    console.log('[Popup] 클릭 이벤트 수신 확인');
     const url = productUrlInput.value.trim();
-    console.log('[Popup] 입력된 URL:', url);
 
     if (!url) {
-      console.warn('[Popup] URL이 비어있음');
       showStatus('쿠팡 상품 URL을 입력해주세요.', 'error');
       return;
     }
 
     if (!url.includes('coupang.com/vp/products/')) {
-      console.warn('[Popup] 유효하지 않은 URL:', url);
       showStatus('유효한 쿠팡 상품 URL이 아닙니다.', 'error');
       return;
     }
-
-    console.log('[Popup] URL 검증 통과');
 
     // URL에서 상품 ID 추출
     let tempProductId = null;
@@ -128,8 +100,6 @@ if (startBtn) {
     const ratingFilterSelect = document.getElementById('ratingFilter');
     const selectedRating = ratingFilterSelect ? ratingFilterSelect.value : '';
     const selectedRatings = selectedRating ? [selectedRating] : null;
-
-    console.log('[Popup] 선택된 별점:', selectedRatings ? selectedRatings : '모든 별점');
 
     // UI 업데이트
     startBtn.disabled = true;
@@ -152,7 +122,6 @@ if (startBtn) {
     setupMessageListener();
 
     // Background Script에 즉시 메시지 전송 (새 탭 생성은 Background에서 처리)
-    console.log('[Popup] ========== Background Script에 메시지 즉시 전송 ==========');
     addLog('Background Script에 수집 요청 전송 중...', 'info');
     addLog(`URL: ${url}`, 'info');
     addLog(`상품 ID: ${productId}`, 'info');
@@ -160,22 +129,16 @@ if (startBtn) {
     // 현재 활성 탭의 ID 가져오기
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (chrome.runtime.lastError) {
-        console.error('[Popup] ❌ 현재 탭 ID 가져오기 실패:', chrome.runtime.lastError.message);
         addLog(`현재 탭 ID 가져오기 실패: ${chrome.runtime.lastError.message}`, 'error');
       }
 
       const currentTabId = tabs && tabs[0] ? tabs[0].id : null;
-      console.log('[Popup] ========== 현재 활성 탭 ID 확인 ==========');
-      console.log('[Popup] 현재 활성 탭 ID:', currentTabId);
-      console.log('[Popup] 현재 활성 탭 URL:', tabs && tabs[0] ? tabs[0].url : 'N/A');
 
       if (!currentTabId) {
-        console.warn('[Popup] ⚠️ 현재 탭 ID를 가져올 수 없습니다.');
         addLog('현재 탭 ID를 가져올 수 없습니다. 새로고침 후 다시 시도해주세요.', 'warning');
       }
 
       try {
-        console.log('[Popup] chrome.runtime.sendMessage 즉시 호출...');
         chrome.runtime.sendMessage(
           {
             action: 'startCollection',
@@ -185,13 +148,8 @@ if (startBtn) {
             ratingFilter: selectedRatings && selectedRatings.length > 0 ? selectedRatings : null // 별점 필터 전달
           },
           (bgResponse) => {
-            console.log('[Popup] ========== Background Script 응답 수신 ==========');
-            console.log('[Popup] Background Script 응답:', bgResponse);
-            console.log('[Popup] chrome.runtime.lastError:', chrome.runtime.lastError);
-
             if (chrome.runtime.lastError) {
               const errorMsg = chrome.runtime.lastError.message;
-              console.error('[Popup] ❌ Background Script 오류:', errorMsg);
               addLog(`Background Script 오류: ${errorMsg}`, 'error');
               showStatus('오류: ' + errorMsg, 'error');
               resetUI();
@@ -200,40 +158,29 @@ if (startBtn) {
 
             if (bgResponse && bgResponse.success) {
               addLog('수집 작업이 시작되었습니다.', 'success');
-              console.log('[Popup] ✅ 수집 작업 시작 성공');
               showStatus('수집이 시작되었습니다. 새 탭에서 진행됩니다...', 'success');
             } else if (bgResponse && !bgResponse.success) {
               addLog(`수집 시작 실패: ${bgResponse.error || '알 수 없는 오류'}`, 'error');
-              console.error('[Popup] ❌ 수집 시작 실패:', bgResponse.error);
               showStatus('오류: ' + (bgResponse.error || '수집을 시작할 수 없습니다.'), 'error');
               resetUI();
             } else {
               addLog('Background Script 응답이 없습니다. 수집이 시작되었을 수 있습니다.', 'warning');
-              console.warn('[Popup] ⚠️ Background Script 응답이 없음');
               showStatus('수집이 시작되었을 수 있습니다. 새 탭을 확인하세요.', 'info');
             }
           }
         );
       } catch (error) {
-        console.error('[Popup] ❌ chrome.runtime.sendMessage 호출 실패:', error);
-        console.error('[Popup] 에러 스택:', error.stack);
         addLog(`메시지 전송 실패: ${error.message}`, 'error');
         showStatus('오류: 메시지 전송 실패', 'error');
         resetUI();
         return;
       }
     }); // chrome.tabs.query 콜백 종료
-
-    console.log('[Popup] ========== 시작 버튼 클릭 핸들러 종료 ==========');
   });
-  console.log('[Popup] ✅ 시작 버튼 이벤트 리스너 등록 완료');
-} else {
-  console.error('[Popup] ❌ 시작 버튼이 없어 이벤트 리스너를 등록할 수 없습니다!');
 }
 
 // 중지 버튼
 stopBtn.addEventListener('click', async () => {
-  console.log('[중지] 중지 버튼 클릭됨');
   isCollecting = false;
   showStatus('수집 중지 요청 중... 현재까지 수집한 데이터를 처리합니다.', 'info');
 
@@ -245,17 +192,14 @@ stopBtn.addEventListener('click', async () => {
     // Background Script에 중지 요청
     chrome.runtime.sendMessage({ action: 'stopCollection' }, (response) => {
       if (chrome.runtime.lastError) {
-        console.error('[중지] 중지 요청 오류:', chrome.runtime.lastError);
         showStatus('중지 요청 중 오류가 발생했습니다: ' + chrome.runtime.lastError.message, 'error');
         stopBtn.disabled = false;
         stopBtn.textContent = '중지';
       } else {
-        console.log('[중지] 중지 요청 전송 완료');
         // complete 메시지가 올 때까지 대기 (messageListener에서 처리)
         // 타임아웃 설정 (10초 후 강제 중지)
         setTimeout(() => {
           if (isCollecting) {
-            console.warn('[중지] 타임아웃: 강제로 상태 초기화');
             isCollecting = false;
             resetUI();
             showStatus('수집이 중지되었습니다.', 'info');
@@ -264,7 +208,6 @@ stopBtn.addEventListener('click', async () => {
       }
     });
   } catch (error) {
-    console.error('[중지] 중지 요청 중 예외:', error);
     showStatus('중지 요청 중 오류가 발생했습니다: ' + error.message, 'error');
     stopBtn.disabled = false;
     stopBtn.textContent = '중지';
@@ -298,7 +241,6 @@ downloadJsonBtn.addEventListener('click', async () => {
       }
     }
   } catch (error) {
-    console.error('[JSON 다운로드] 탭 title 가져오기 실패:', error);
     // 오류 발생 시 기본값 사용
   }
 
@@ -348,7 +290,6 @@ downloadExcelBtn.addEventListener('click', async () => {
       }
     }
   } catch (error) {
-    console.error('[Excel 다운로드] 탭 title 가져오기 실패:', error);
     // 오류 발생 시 기본값 사용
   }
 
@@ -489,18 +430,15 @@ function filterReviewsByCurrentTab() {
     filteredReviews = collectedReviews.filter(review => {
       return review.originalTabId && review.originalTabId.toString() === currentTabId.toString();
     });
-    console.log('[리뷰 필터링] 현재 탭 ID:', currentTabId, ', 필터링된 리뷰 수:', filteredReviews.length);
   } else {
     // 현재 탭 ID가 없으면 모든 리뷰 표시
     filteredReviews = [...collectedReviews];
-    console.log('[리뷰 필터링] 현재 탭 ID가 없어 모든 리뷰 표시');
   }
 }
 
 // 현재 탭 ID의 리뷰 불러오기
 async function loadReviewsForCurrentTab() {
   if (!currentTabId) {
-    console.log('[리뷰 불러오기] 현재 탭 ID가 없음');
     return;
   }
 
@@ -516,12 +454,7 @@ async function loadReviewsForCurrentTab() {
         const isStopped = collectionData.stopped || false;
         filteredReviews = [...collectedReviews];
         showResults(collectedReviews.length, isStopped);
-        console.log(`[리뷰 불러오기] 탭 ID ${currentTabId}의 리뷰 ${collectedReviews.length}개 불러옴`);
-      } else {
-        console.log(`[리뷰 불러오기] 탭 ID ${currentTabId}의 리뷰가 만료됨 (${Math.floor(timeDiff / 1000 / 60)}분 전)`);
       }
-    } else {
-      console.log(`[리뷰 불러오기] 탭 ID ${currentTabId}의 리뷰를 찾을 수 없음`);
     }
   });
 }
@@ -562,7 +495,6 @@ function restoreState() {
     // 수집 상태 확인
     chrome.runtime.sendMessage({ action: 'getCollectionStatus' }, async (response) => {
       if (chrome.runtime.lastError) {
-        console.error('상태 조회 오류:', chrome.runtime.lastError);
         // 오류가 발생해도 현재 페이지 URL은 가져오기
         await loadCurrentPageUrl();
         resolve();
@@ -574,13 +506,8 @@ function restoreState() {
       isCollecting = true;
       productId = response.productId;
 
-      // URL 복원 (수집 중인 경우 우선)
-      if (response.url) {
-        productUrlInput.value = response.url;
-      } else {
-        // 수집 중이지만 URL이 없으면 현재 페이지 URL 가져오기
-        await loadCurrentPageUrl();
-      }
+      // 항상 현재 탭의 URL 사용
+      await loadCurrentPageUrl();
 
       // UI를 수집 중 상태로 변경
       startBtn.disabled = true;
@@ -611,16 +538,10 @@ function restoreState() {
       } else {
       // 수집 중이 아니면 완료된 데이터 확인
       // 먼저 현재 탭 ID를 가져온 후 해당 탭의 리뷰만 불러오기
+      // 항상 현재 탭의 URL 사용
       await loadCurrentPageUrl();
 
       chrome.storage.local.get(['lastUrl'], async (result) => {
-        // 저장된 URL이 있으면 사용, 없으면 현재 페이지 URL 자동 추출
-        if (result.lastUrl && result.lastUrl.includes('coupang.com/vp/products/')) {
-          productUrlInput.value = result.lastUrl;
-        } else {
-          // 저장된 URL이 없거나 유효하지 않으면 현재 페이지 URL 자동 추출
-          await loadCurrentPageUrl();
-        }
 
         // 현재 탭 ID로 해당 탭의 리뷰만 불러오기
         if (currentTabId) {
@@ -636,12 +557,7 @@ function restoreState() {
                 // 현재 탭의 리뷰만 표시 (이미 해당 탭의 리뷰만 불러왔으므로 필터링 불필요)
                 filteredReviews = [...collectedReviews];
                 showResults(collectedReviews.length, isStopped);
-                console.log(`[Popup] 탭 ID ${currentTabId}의 리뷰 ${collectedReviews.length}개 불러옴`);
-              } else {
-                console.log(`[Popup] 탭 ID ${currentTabId}의 리뷰가 만료됨 (${Math.floor(timeDiff / 1000 / 60)}분 전)`);
               }
-            } else {
-              console.log(`[Popup] 탭 ID ${currentTabId}의 리뷰를 찾을 수 없음`);
             }
             resolve();
           });
@@ -741,7 +657,7 @@ restoreState().then(() => {
     }, 100);
   }
 }).catch(err => {
-  console.error('[Popup] 상태 복원 중 오류:', err);
+  // 오류 처리
 });
 
 // 로그는 새 탭의 모달 창에서만 표시됨
