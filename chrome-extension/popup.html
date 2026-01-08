@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>쿠팡 리뷰 수집기</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+  <div class="container">
+    <header>
+      <h1>🛒 쿠팡 리뷰 수집기</h1>
+      <p class="subtitle">상품 리뷰를 자동으로 수집합니다</p>
+    </header>
+
+    <div class="content">
+      <!-- URL 입력 섹션 -->
+      <div class="section">
+        <label for="productUrl">쿠팡 상품 URL</label>
+        <input type="text" id="productUrl" placeholder="https://www.coupang.com/vp/products/..." autocomplete="off">
+      </div>
+
+      <!-- 별점 필터 섹션 -->
+      <div class="section">
+        <label for="ratingFilter">별점 필터</label>
+        <select id="ratingFilter" class="rating-select">
+          <option value="">모든 별점 수집</option>
+          <option value="1">⭐ 1점</option>
+          <option value="2">⭐⭐ 2점</option>
+          <option value="3">⭐⭐⭐ 3점</option>
+          <option value="4">⭐⭐⭐⭐ 4점</option>
+          <option value="5">⭐⭐⭐⭐⭐ 5점</option>
+        </select>
+      </div>
+
+      <!-- 상태 표시 -->
+      <div id="status" class="status hidden"></div>
+
+      <!-- 진행률 표시 -->
+      <div id="progress" class="progress hidden">
+        <div class="progress-bar">
+          <div id="progressFill" class="progress-fill"></div>
+        </div>
+        <div id="progressText" class="progress-text">0%</div>
+      </div>
+
+
+      <!-- 시작 버튼 -->
+      <button id="startBtn" class="btn-primary">리뷰 수집 시작</button>
+      <button id="stopBtn" class="btn-danger hidden">중지</button>
+
+      <!-- 결과 섹션 -->
+      <div id="results" class="results hidden">
+        <div class="results-header">
+          <h3>수집 완료!</h3>
+          <div id="resultInfo"></div>
+        </div>
+
+        <!-- 리뷰 조회 탭 -->
+        <div id="previewTab" class="tab-content active">
+          <div class="preview-controls">
+            <input type="text" id="searchInput" class="search-input" placeholder="리뷰 내용 검색...">
+            <select id="sortSelect" class="sort-select" title="정렬 기준">
+              <option value="date-desc">날짜 최신순</option>
+              <option value="date-asc">날짜 오래된순</option>
+              <option value="rating-desc">평점 높은순</option>
+              <option value="rating-asc">평점 낮은순</option>
+            </select>
+          </div>
+          <div id="reviewTableContainer" class="review-table-container">
+            <table id="reviewTable" class="review-table">
+              <thead>
+                <tr>
+                  <th>번호</th>
+                  <th>날짜</th>
+                  <th>평점</th>
+                  <th>내용</th>
+                </tr>
+              </thead>
+              <tbody id="reviewTableBody"></tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <button id="prevPage" class="page-btn" disabled>이전</button>
+            <span id="pageInfo" class="page-info">1 / 1</span>
+            <button id="nextPage" class="page-btn" disabled>다음</button>
+          </div>
+        </div>
+
+        <!-- 다운로드 탭 -->
+        <div id="downloadTab" class="tab-content">
+          <div class="button-group">
+            <button id="downloadJson" class="btn-download">JSON 다운로드</button>
+            <button id="downloadExcel" class="btn-download">Excel 다운로드</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <p class="version">버전 1.0.0</p>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+
+</html>

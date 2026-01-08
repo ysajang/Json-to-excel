@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output files
+*.xlsx
+*.json
+reviews_*.xlsx
+reviews_*.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build files
+build/
+*.exe
+*.pkg
+*.toc
+*.pyz
+*.pyc
+warn-*.txt
+xref-*.html
+
+# Chrome extension
+*.crx
+*.pem
