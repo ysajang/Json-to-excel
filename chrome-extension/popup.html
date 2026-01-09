@@ -22,6 +22,19 @@
         <input type="text" id="productUrl" placeholder="https://www.coupang.com/vp/products/..." autocomplete="off">
       </div>
 
+      <!-- 별점 필터 섹션 -->
+      <div class="section">
+        <label for="ratingFilter">별점 필터</label>
+        <select id="ratingFilter" class="rating-select">
+          <option value="all">모든 별점</option>
+          <option value="5">최고(5)</option>
+          <option value="4">좋음(4)</option>
+          <option value="3">보통(3)</option>
+          <option value="2">별로(2)</option>
+          <option value="1">나쁨(1)</option>
+        </select>
+      </div>
+
       <!-- 상태 표시 -->
       <div id="status" class="status hidden"></div>
 
@@ -55,6 +68,7 @@
               <option value="rating-desc">평점 높은순</option>
               <option value="rating-asc">평점 낮은순</option>
             </select>
+            <button id="copyTableBtn" class="btn-copy" title="테이블을 클립보드에 복사">📋 복사</button>
           </div>
           <div id="reviewTableContainer" class="review-table-container">
             <table id="reviewTable" class="review-table">
@@ -62,8 +76,11 @@
                 <tr>
                   <th>번호</th>
                   <th>날짜</th>
+                  <th>작성자</th>
                   <th>평점</th>
+                  <th>제목</th>
                   <th>내용</th>
+                  <th>상품평가</th>
                 </tr>
               </thead>
               <tbody id="reviewTableBody"></tbody>

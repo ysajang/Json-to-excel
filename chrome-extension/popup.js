@@ -1,5 +1,6 @@
 
 const productUrlInput = document.getElementById('productUrl');
+const ratingFilterSelect = document.getElementById('ratingFilter');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const statusDiv = document.getElementById('status');
@@ -10,6 +11,7 @@ const resultsDiv = document.getElementById('results');
 const resultInfo = document.getElementById('resultInfo');
 const downloadJsonBtn = document.getElementById('downloadJson');
 const downloadExcelBtn = document.getElementById('downloadExcel');
+const copyTableBtn = document.getElementById('copyTableBtn');
 
 
 let isCollecting = false;
@@ -17,8 +19,8 @@ let collectedReviews = null;
 let productId = null;
 let filteredReviews = null;
 let currentPage = 1;
-const itemsPerPage = 20;
-let currentTabId = null; 
+const itemsPerPage = 10;
+let currentTabId = null;
 
 
 function addLog(message, type = 'info') {
@@ -32,7 +34,7 @@ function saveLogToStorage(message, type, time) {
     logs.push({ message, type, time, timestamp: Date.now() });
 
     if (logs.length > 200) {
-      logs.shift(); 
+      logs.shift();
     }
 
     chrome.storage.local.set({ collectionLogs: logs });
@@ -115,12 +117,14 @@ if (startBtn) {
       }
 
       try {
+        const ratingFilter = ratingFilterSelect ? ratingFilterSelect.value : 'all';
         chrome.runtime.sendMessage(
           {
             action: 'startCollection',
             url: url,
             productId: productId,
-            originalTabId: currentTabId 
+            originalTabId: currentTabId,
+            ratingFilter: ratingFilter
           },
           (bgResponse) => {
             if (chrome.runtime.lastError) {
@@ -150,7 +154,7 @@ if (startBtn) {
         resetUI();
         return;
       }
-    }); 
+    });
   });
 }
 
@@ -163,7 +167,10 @@ stopBtn.addEventListener('click', async () => {
   stopBtn.textContent = '중지 중...';
 
   try {
-    chrome.runtime.sendMessage({ action: 'stopCollection' }, (response) => {
+    chrome.runtime.sendMessage({
+      action: 'stopCollection',
+      originalTabId: currentTabId
+    }, (response) => {
       if (chrome.runtime.lastError) {
         showStatus('중지 요청 중 오류가 발생했습니다: ' + chrome.runtime.lastError.message, 'error');
         stopBtn.disabled = false;
@@ -195,9 +202,9 @@ downloadJsonBtn.addEventListener('click', async () => {
       const tab = await chrome.tabs.get(currentTabId);
       if (tab && tab.title) {
         tabTitle = tab.title
-          .replace(/[<>:"/\\|?*]/g, '_') 
-          .replace(/\s+/g, '_') 
-          .substring(0, 100); 
+          .replace(/[<>:"/\\|?*]/g, '_')
+          .replace(/\s+/g, '_')
+          .substring(0, 100);
       }
     } else {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -240,9 +247,9 @@ downloadExcelBtn.addEventListener('click', async () => {
       const tab = await chrome.tabs.get(currentTabId);
       if (tab && tab.title) {
         tabTitle = tab.title
-          .replace(/[<>:"/\\|?*]/g, '_') 
-          .replace(/\s+/g, '_') 
-          .substring(0, 100); 
+          .replace(/[<>:"/\\|?*]/g, '_')
+          .replace(/\s+/g, '_')
+          .substring(0, 100);
       }
     } else {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -322,7 +329,7 @@ function renderReviewTable() {
   if (!filteredReviews || filteredReviews.length === 0) {
     const tbody = document.getElementById('reviewTableBody');
     if (tbody) {
-      tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; padding: 20px;">표시할 리뷰가 없습니다.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 20px;">표시할 리뷰가 없습니다.</td></tr>';
     }
     updatePagination();
     return;
@@ -342,15 +349,24 @@ function renderReviewTable() {
     const globalIndex = startIndex + index + 1;
 
     const date = review.date || '날짜 없음';
-    const rating = review.rating || 0;
+    const author = review.author || '작성자 없음';
+    const rating = parseInt(review.rating) || 0;
+    const title = review.title || '(제목 없음)';
     const content = review.content || '(내용 없음)';
+    const productEvaluation = review.productEvaluation || '(평가 없음)';
+
+    const truncatedTitle = title.length > 30 ? title.substring(0, 30) + '...' : title;
     const truncatedContent = content.length > 50 ? content.substring(0, 50) + '...' : content;
+    const truncatedEvaluation = productEvaluation.length > 50 ? productEvaluation.substring(0, 50) + '...' : productEvaluation;
 
     row.innerHTML = `
       <td>${globalIndex}</td>
       <td>${date}</td>
+      <td>${author}</td>
       <td><span class="rating-stars">${'★'.repeat(rating)}${'☆'.repeat(5 - rating)}</span> (${rating})</td>
+      <td class="review-content-cell" title="${title.replace(/"/g, '&quot;')}">${truncatedTitle}</td>
       <td class="review-content-cell" title="${content.replace(/"/g, '&quot;')}">${truncatedContent}</td>
+      <td class="review-content-cell" title="${productEvaluation.replace(/"/g, '&quot;')}">${truncatedEvaluation}</td>
     `;
 
     tbody.appendChild(row);
@@ -399,17 +415,22 @@ async function loadReviewsForCurrentTab() {
   }
 
   const storageKey = `collection_${currentTabId}`;
-  chrome.storage.local.get([storageKey], (result) => {
+  chrome.storage.local.get([storageKey, 'lastCollection'], (result) => {
+    // 현재 탭의 데이터를 우선적으로 확인
     if (result[storageKey] && result[storageKey].reviews) {
       const collectionData = result[storageKey];
-      const timeDiff = Date.now() - collectionData.timestamp;
-
-      if (timeDiff < 5 * 60 * 1000) {
-        collectedReviews = collectionData.reviews;
-        const isStopped = collectionData.stopped || false;
-        filteredReviews = [...collectedReviews];
-        showResults(collectedReviews.length, isStopped);
-      }
+      collectedReviews = collectionData.reviews;
+      const isStopped = collectionData.stopped || false;
+      filteredReviews = [...collectedReviews];
+      showResults(collectedReviews.length, isStopped);
+    }
+    // 현재 탭에 데이터가 없으면 lastCollection 확인
+    else if (result.lastCollection && result.lastCollection.reviews) {
+      collectedReviews = result.lastCollection.reviews;
+      const isStopped = result.lastCollection.stopped || false;
+      filterReviewsByCurrentTab();
+      const displayCount = filteredReviews ? filteredReviews.length : 0;
+      showResults(displayCount, isStopped);
     }
   });
 }
@@ -444,7 +465,10 @@ function resetUI() {
 
 function restoreState() {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ action: 'getCollectionStatus' }, async (response) => {
+    chrome.runtime.sendMessage({
+      action: 'getCollectionStatus',
+      originalTabId: currentTabId
+    }, async (response) => {
       if (chrome.runtime.lastError) {
         await loadCurrentPageUrl();
         resolve();
@@ -452,70 +476,64 @@ function restoreState() {
       }
 
       if (response && response.isCollecting) {
-      isCollecting = true;
-      productId = response.productId;
+        isCollecting = true;
+        productId = response.productId;
 
-      await loadCurrentPageUrl();
+        await loadCurrentPageUrl();
 
-      startBtn.disabled = true;
-      startBtn.classList.add('hidden');
-      stopBtn.classList.remove('hidden');
-      progressDiv.classList.remove('hidden');
-      statusDiv.classList.remove('hidden');
+        startBtn.disabled = true;
+        startBtn.classList.add('hidden');
+        stopBtn.classList.remove('hidden');
+        progressDiv.classList.remove('hidden');
+        statusDiv.classList.remove('hidden');
 
-      showStatus('수집이 진행 중입니다. 중지 버튼을 눌러 중지할 수 있습니다.', 'info');
+        showStatus('수집이 진행 중입니다. 중지 버튼을 눌러 중지할 수 있습니다.', 'info');
 
-      loadLogsFromStorage();
+        loadLogsFromStorage();
 
-      chrome.storage.local.get(['collectionProgress'], (progressResult) => {
-        if (progressResult.collectionProgress) {
-          const progress = progressResult.collectionProgress;
-          updateProgress(progress.percent, progress.text);
-        } else {
-          updateProgress(0, '수집 중...');
-        }
-      });
+        const progressStorageKey = currentTabId ? `collectionProgress_${currentTabId}` : 'collectionProgress';
+        chrome.storage.local.get([progressStorageKey], (progressResult) => {
+          const progress = progressResult[progressStorageKey];
+          if (progress) {
+            updateProgress(progress.percent, progress.text);
+          } else {
+            updateProgress(0, '수집 중...');
+          }
+        });
 
-      setupMessageListener();
-      resolve();
+        setupMessageListener();
+        resolve();
       } else {
-      await loadCurrentPageUrl();
+        await loadCurrentPageUrl();
 
-      chrome.storage.local.get(['lastUrl'], async (result) => {
+        chrome.storage.local.get(['lastUrl'], async (result) => {
 
-        if (currentTabId) {
-          const storageKey = `collection_${currentTabId}`;
-          chrome.storage.local.get([storageKey], (tabResult) => {
-            if (tabResult[storageKey] && tabResult[storageKey].reviews) {
-              const collectionData = tabResult[storageKey];
-              const timeDiff = Date.now() - collectionData.timestamp;
-              if (timeDiff < 5 * 60 * 1000) {
-                collectedReviews = collectionData.reviews;
-                const isStopped = collectionData.stopped || false;
-                filteredReviews = [...collectedReviews];
-                showResults(collectedReviews.length, isStopped);
-              }
+          // 현재 탭의 데이터와 lastCollection 모두 확인
+          const storageKey = currentTabId ? `collection_${currentTabId}` : null;
+          const keysToGet = storageKey ? [storageKey, 'lastCollection'] : ['lastCollection'];
+
+          chrome.storage.local.get(keysToGet, (result) => {
+            // 현재 탭의 데이터를 우선적으로 확인
+            if (storageKey && result[storageKey] && result[storageKey].reviews) {
+              const collectionData = result[storageKey];
+              collectedReviews = collectionData.reviews;
+              const isStopped = collectionData.stopped || false;
+              filteredReviews = [...collectedReviews];
+              showResults(collectedReviews.length, isStopped);
+            }
+            // 현재 탭에 데이터가 없으면 lastCollection 확인
+            else if (result.lastCollection && result.lastCollection.reviews) {
+              collectedReviews = result.lastCollection.reviews;
+              const isStopped = result.lastCollection.stopped || false;
+              filterReviewsByCurrentTab();
+              const displayCount = filteredReviews ? filteredReviews.length : 0;
+              showResults(displayCount, isStopped);
             }
             resolve();
           });
-        } else {
-          chrome.storage.local.get(['lastCollection'], (result) => {
-            if (result.lastCollection && result.lastCollection.reviews) {
-              const timeDiff = Date.now() - result.lastCollection.timestamp;
-              if (timeDiff < 5 * 60 * 1000) {
-                collectedReviews = result.lastCollection.reviews;
-                const isStopped = result.lastCollection.stopped || false;
-                filterReviewsByCurrentTab();
-                const displayCount = filteredReviews ? filteredReviews.length : 0;
-                showResults(displayCount, isStopped);
-              }
-            }
-            resolve();
-          });
-        }
-      });
+        });
       }
-      return true; 
+      return true;
     });
   });
 }
@@ -527,6 +545,10 @@ function setupMessageListener() {
   }
 
   window.messageListener = (message, sender, sendResponse) => {
+    if (message.originalTabId && message.originalTabId !== currentTabId) {
+      return;
+    }
+
     if (message.action === 'progress') {
       updateProgress(message.percent, message.text);
       if (message.log) {
@@ -556,7 +578,7 @@ function setupMessageListener() {
         showStatus(message.message || `수집 종료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'info');
         filterReviewsByCurrentTab();
         const displayCount = filteredReviews ? filteredReviews.length : 0;
-        showResults(displayCount, true); 
+        showResults(displayCount, true);
       } else {
         addLog('수집이 중지되었습니다.', 'warning');
         showStatus(message.message || '수집이 중지되었습니다.', 'info');

@@ -5,8 +5,8 @@
 }
 
 body {
-  width: 400px;
-  min-height: 500px;
+  width: 800px;
+  min-height: 600px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   color: #333;
@@ -329,6 +329,35 @@ input[type="checkbox"] {
   border: 1px solid #e0e0e0;
 }
 
+.btn-copy {
+  padding: 8px 16px;
+  background: #28a745;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.btn-copy:hover {
+  background: #218838;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(40, 167, 69, 0.3);
+}
+
+.btn-copy:active {
+  transform: translateY(0);
+}
+
+.btn-copy:disabled {
+  background: #6c757d;
+  cursor: not-allowed;
+  transform: none;
+}
+
 .preview-controls {
   display: flex;
   gap: 10px;
@@ -400,4 +429,112 @@ footer {
   animation: spin 0.8s linear infinite;
   margin-right: 8px;
   vertical-align: middle;
+}
+
+.review-table-container {
+  overflow-x: auto;
+  max-height: 400px;
+  overflow-y: auto;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  margin-bottom: 15px;
+}
+
+.review-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  background: white;
+}
+
+.review-table thead {
+  position: sticky;
+  top: 0;
+  background: #667eea;
+  color: white;
+  z-index: 10;
+}
+
+.review-table th {
+  padding: 12px 8px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 12px;
+  white-space: nowrap;
+  border-bottom: 2px solid #5568d3;
+}
+
+.review-table th:nth-child(2) {
+  min-width: 120px;
+  width: 120px;
+}
+
+.review-table td {
+  padding: 10px 8px;
+  border-bottom: 1px solid #e0e0e0;
+  vertical-align: top;
+  word-wrap: break-word;
+  max-width: 200px;
+}
+
+.review-table td:nth-child(2) {
+  min-width: 120px;
+  width: 120px;
+  white-space: nowrap;
+}
+
+.review-table tbody tr:hover {
+  background: #f8f9fa;
+}
+
+.review-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.review-content-cell {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rating-stars {
+  color: #ffc107;
+  font-size: 14px;
+  letter-spacing: 2px;
+}
+
+.pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  margin-top: 15px;
+}
+
+.page-btn {
+  padding: 8px 16px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: white;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.page-btn:hover:not(:disabled) {
+  background: #667eea;
+  color: white;
+  border-color: #667eea;
+}
+
+.page-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.page-info {
+  font-size: 14px;
+  color: #666;
+  font-weight: 500;
 }

@@ -1,13 +1,12 @@
 
 
-let currentCollection = null;
-let collectionTabId = null;
-let originalTabId = null; 
+const collectionsByTab = new Map();
 
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'startCollection') {
+    let originalTabId = null;
     if (request.originalTabId) {
       originalTabId = request.originalTabId;
     } else if (sender.tab && sender.tab.id) {
@@ -20,8 +19,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       });
     }
 
-    if (currentCollection) {
-      const errorMsg = '이미 수집 중입니다.';
+    if (originalTabId && collectionsByTab.has(originalTabId)) {
+      const errorMsg = '이 탭에서 이미 수집 중입니다.';
       try {
         sendResponse({ success: false, error: errorMsg });
       } catch (e) {
@@ -40,23 +39,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         active: true
       }).then(newTab => {
         setTimeout(() => {
-          startCollection(request.url, newTab.id, request.productId)
+          startCollection(request.url, newTab.id, request.productId, request.ratingFilter || 'all', originalTabId)
             .catch(error => {
-              currentCollection = null;
-              chrome.storage.local.remove('collectionStatus');
-              if (collectionTabId) {
+              if (originalTabId) {
+                collectionsByTab.delete(originalTabId);
               }
+              const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
+              chrome.storage.local.remove(storageKey);
             });
-        }, 3000);
+        }, 2000);
       }).catch(error => {
-        currentCollection = null;
-        chrome.storage.local.remove('collectionStatus');
+        if (originalTabId) {
+          collectionsByTab.delete(originalTabId);
+        }
+        const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
+        chrome.storage.local.remove(storageKey);
       });
 
-      return true; 
+      return true;
     }
 
-    startCollection(request.url, request.tabId, request.productId)
+    startCollection(request.url, request.tabId, request.productId, request.ratingFilter || 'all', originalTabId)
       .then(() => {
         try {
           sendResponse({ success: true });
@@ -64,10 +67,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
       })
       .catch(error => {
-        currentCollection = null;
-        chrome.storage.local.remove('collectionStatus');
-        if (collectionTabId) {
+        if (originalTabId) {
+          collectionsByTab.delete(originalTabId);
         }
+        const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
+        chrome.storage.local.remove(storageKey);
         try {
           sendResponse({ success: false, error: error.message });
         } catch (e) {
@@ -75,7 +79,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       });
     return true;
   } else if (request.action === 'stopCollection') {
-    stopCollection();
+    let originalTabId = null;
+    if (request.originalTabId) {
+      originalTabId = request.originalTabId;
+    } else if (sender.tab && sender.tab.id) {
+      originalTabId = sender.tab.id;
+    }
+    stopCollection(originalTabId);
     sendResponse({ success: true });
   } else if (request.action === 'convertToExcel') {
     try {
@@ -87,17 +97,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   } else if (request.action === 'progress' || request.action === 'log') {
     if (request.action === 'progress') {
+      const originalTabId = request.originalTabId || null;
+      const storageKey = originalTabId ? `collectionProgress_${originalTabId}` : 'collectionProgress';
       chrome.storage.local.set({
-        collectionProgress: {
+        [storageKey]: {
           percent: request.percent,
           text: request.text,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          originalTabId: originalTabId
         }
       });
     }
 
     if (request.action === 'log') {
       const time = new Date().toLocaleTimeString('ko-KR');
+      const logMessage = `[리뷰 수집기] ${request.message}`;
+
+      // 서비스 워커 콘솔에 출력
+      if (request.type === 'error') {
+        console.error(logMessage);
+      } else if (request.type === 'warning') {
+        console.warn(logMessage);
+      } else if (request.type === 'success') {
+        console.log(`%c${logMessage}`, 'color: green; font-weight: bold');
+      } else {
+        console.log(logMessage);
+      }
+
       chrome.storage.local.get(['collectionLogs'], (result) => {
         const logs = result.collectionLogs || [];
         logs.push({
@@ -121,29 +147,36 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } catch (err) {
     }
 
-    if (collectionTabId) {
+    const collection = request.originalTabId ? collectionsByTab.get(request.originalTabId) : null;
+    if (collection && collection.collectionTabId) {
       try {
-        chrome.tabs.sendMessage(collectionTabId, request).catch((err) => {
+        chrome.tabs.sendMessage(collection.collectionTabId, request).catch((err) => {
         });
       } catch (err) {
       }
     }
   } else if (request.action === 'complete') {
-    currentCollection = null;
-    chrome.storage.local.remove('collectionStatus');
+    const originalTabId = request.originalTabId || null;
+    const collection = originalTabId ? collectionsByTab.get(originalTabId) : null;
+
+    if (collection) {
+      collectionsByTab.delete(originalTabId);
+      const storageKey = `collectionStatus_${originalTabId}`;
+      chrome.storage.local.remove(storageKey);
+    }
 
     const collectionData = {
       reviews: request.reviews,
       timestamp: Date.now(),
       stopped: request.stopped || false,
-      originalTabId: originalTabId || null
+      originalTabId: originalTabId
     };
 
     if (originalTabId) {
       const storageKey = `collection_${originalTabId}`;
       chrome.storage.local.set({
         [storageKey]: collectionData,
-        lastCollection: collectionData 
+        lastCollection: collectionData
       });
     } else {
       chrome.storage.local.set({
@@ -155,15 +188,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.runtime.sendMessage({
         action: 'complete',
         reviews: request.reviews,
-        stopped: request.stopped || false
+        stopped: request.stopped || false,
+        originalTabId: originalTabId
       }).catch((err) => {
       });
     } catch (err) {
     }
 
-    if (collectionTabId) {
+    if (collection && collection.collectionTabId) {
       try {
-        chrome.tabs.sendMessage(collectionTabId, {
+        chrome.tabs.sendMessage(collection.collectionTabId, {
           action: 'complete',
           reviews: request.reviews,
           stopped: request.stopped || false
@@ -171,9 +205,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         });
       } catch (err) {
       }
-    }
 
-    if (collectionTabId) {
       try {
         chrome.runtime.sendMessage({
           action: 'log',
@@ -183,7 +215,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       } catch (e) {}
 
       setTimeout(() => {
-        chrome.tabs.remove(collectionTabId).then(() => {
+        chrome.tabs.remove(collection.collectionTabId).then(() => {
           try {
             chrome.runtime.sendMessage({
               action: 'log',
@@ -191,20 +223,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               type: 'success'
             }).catch(() => {});
           } catch (e) {}
-          collectionTabId = null;
-          originalTabId = null;
+
+          // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
+          if (originalTabId) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+              if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
+                chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
+              }
+            });
+          }
         }).catch(err => {
-          collectionTabId = null;
-          originalTabId = null;
         });
-      }, 2000); 
+      }, 2000);
     }
   } else if (request.action === 'stopped') {
-    currentCollection = null;
-    chrome.storage.local.remove('collectionStatus');
+    const originalTabId = request.originalTabId || null;
+    const collection = originalTabId ? collectionsByTab.get(originalTabId) : null;
 
-    if (!collectionTabId && sender.tab && sender.tab.id) {
-      collectionTabId = sender.tab.id;
+    if (collection) {
+      collectionsByTab.delete(originalTabId);
+      const storageKey = `collectionStatus_${originalTabId}`;
+      chrome.storage.local.remove(storageKey);
     }
 
     if (request.reviews !== undefined) {
@@ -212,14 +251,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         reviews: request.reviews || [],
         timestamp: Date.now(),
         stopped: true,
-        originalTabId: originalTabId || null
+        originalTabId: originalTabId
       };
 
       if (originalTabId) {
         const storageKey = `collection_${originalTabId}`;
         chrome.storage.local.set({
           [storageKey]: collectionData,
-          lastCollection: collectionData 
+          lastCollection: collectionData
         });
       } else {
         chrome.storage.local.set({
@@ -232,24 +271,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.runtime.sendMessage({
         action: 'stopped',
         message: request.message || '수집이 중지되었습니다.',
-        reviews: request.reviews || [] 
+        reviews: request.reviews || [],
+        originalTabId: originalTabId
       }).catch((err) => {
       });
     } catch (err) {
     }
 
-    if (collectionTabId) {
+    if (collection && collection.collectionTabId) {
       try {
-        chrome.tabs.sendMessage(collectionTabId, {
+        chrome.tabs.sendMessage(collection.collectionTabId, {
           action: 'stopped',
           message: request.message || '수집이 중지되었습니다.'
         }).catch((err) => {
         });
       } catch (err) {
       }
-    }
 
-    if (collectionTabId) {
       try {
         chrome.runtime.sendMessage({
           action: 'log',
@@ -259,7 +297,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       } catch (e) {}
 
       setTimeout(() => {
-        chrome.tabs.remove(collectionTabId).then(() => {
+        chrome.tabs.remove(collection.collectionTabId).then(() => {
           try {
             chrome.runtime.sendMessage({
               action: 'log',
@@ -267,28 +305,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               type: 'success'
             }).catch(() => {});
           } catch (e) {}
-          collectionTabId = null;
-          originalTabId = null;
+
+          // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
+          if (originalTabId) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+              if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
+                chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
+              }
+            });
+          }
         }).catch(err => {
-          collectionTabId = null;
-          originalTabId = null;
         });
-      }, 500); 
+      }, 500);
     }
   } else if (request.action === 'error') {
-    currentCollection = null;
-    chrome.storage.local.remove('collectionStatus');
+    const originalTabId = request.originalTabId || null;
+    const collection = originalTabId ? collectionsByTab.get(originalTabId) : null;
 
-    if (collectionTabId) {
+    if (collection) {
+      collectionsByTab.delete(originalTabId);
+      const storageKey = `collectionStatus_${originalTabId}`;
+      chrome.storage.local.remove(storageKey);
+    }
+
+    if (collection && collection.collectionTabId) {
       setTimeout(() => {
-        chrome.tabs.remove(collectionTabId).then(() => {
-          collectionTabId = null;
-          originalTabId = null;
+        chrome.tabs.remove(collection.collectionTabId).then(() => {
         }).catch(err => {
-          collectionTabId = null;
-          originalTabId = null;
         });
-      }, 500); 
+      }, 500);
     }
 
     try {
@@ -297,58 +342,70 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } catch (err) {
     }
 
-    if (collectionTabId) {
+    if (collection && collection.collectionTabId) {
       try {
-        chrome.tabs.sendMessage(collectionTabId, request).catch((err) => {
+        chrome.tabs.sendMessage(collection.collectionTabId, request).catch((err) => {
         });
       } catch (err) {
       }
     }
   } else if (request.action === 'getCollectionStatus') {
-    if (currentCollection) {
+    const originalTabId = request.originalTabId || null;
+    const collection = originalTabId ? collectionsByTab.get(originalTabId) : null;
+
+    if (collection) {
       sendResponse({
         isCollecting: true,
-        url: currentCollection.url,
-        tabId: currentCollection.tabId,
-        productId: currentCollection.productId,
-        startTime: currentCollection.startTime
+        url: collection.url,
+        tabId: collection.tabId,
+        productId: collection.productId,
+        startTime: collection.startTime,
+        originalTabId: originalTabId
       });
+      return true;
     } else {
-      chrome.storage.local.get(['collectionStatus'], (result) => {
-        if (result.collectionStatus && result.collectionStatus.isCollecting) {
-          sendResponse(result.collectionStatus);
+      const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
+      chrome.storage.local.get([storageKey], (result) => {
+        if (result[storageKey] && result[storageKey].isCollecting) {
+          sendResponse(result[storageKey]);
         } else {
-          sendResponse({ isCollecting: false });
+          sendResponse({ isCollecting: false, originalTabId: originalTabId });
         }
       });
-      return true; 
+      return true;
     }
-    return true;
   }
 });
 
 
-async function startCollection(url, tabId, productId) {
-  if (currentCollection) {
-    throw new Error('이미 수집 중입니다.');
+async function startCollection(url, tabId, productId, ratingFilter = 'all', originalTabId = null) {
+  if (originalTabId && collectionsByTab.has(originalTabId)) {
+    throw new Error('이 탭에서 이미 수집 중입니다.');
   }
 
-  currentCollection = {
+  const collection = {
     url,
     tabId,
     productId,
+    ratingFilter,
+    collectionTabId: tabId,
+    originalTabId: originalTabId,
     startTime: Date.now()
   };
 
-  collectionTabId = tabId;
+  if (originalTabId) {
+    collectionsByTab.set(originalTabId, collection);
+  }
 
+  const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
   chrome.storage.local.set({
-    collectionStatus: {
+    [storageKey]: {
       isCollecting: true,
       url,
       tabId,
       productId,
-      startTime: currentCollection.startTime
+      originalTabId: originalTabId,
+      startTime: collection.startTime
     }
   });
 
@@ -366,7 +423,7 @@ async function startCollection(url, tabId, productId) {
     } catch (pingError) {
       pingRetries--;
       if (pingRetries > 0) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
   }
@@ -380,22 +437,16 @@ async function startCollection(url, tabId, productId) {
       const response = await chrome.tabs.sendMessage(tabId, {
         action: 'startScraping',
         url,
-        originalTabId: originalTabId 
+        originalTabId: originalTabId,
+        ratingFilter: ratingFilter
       });
 
       if (response && response.success) {
         startScrapingSuccess = true;
-
-        if (originalTabId) {
-          chrome.tabs.update(originalTabId, { active: true }).then(() => {
-          }).catch(err => {
-          });
-        }
-
         break;
       } else if (response && !response.success) {
         lastError = new Error(response.error || '수집을 시작할 수 없습니다.');
-        break; 
+        break;
       }
     } catch (error) {
       lastError = error;
@@ -405,14 +456,17 @@ async function startCollection(url, tabId, productId) {
         if (error.message && error.message.includes('Extension context invalidated')) {
           break;
         }
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
   }
 
   if (!startScrapingSuccess) {
-    currentCollection = null;
-    chrome.storage.local.remove('collectionStatus');
+    if (originalTabId) {
+      collectionsByTab.delete(originalTabId);
+    }
+    const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
+    chrome.storage.local.remove(storageKey);
 
     if (lastError) {
       if (lastError.message && lastError.message.includes('Extension context invalidated')) {
@@ -429,16 +483,31 @@ async function startCollection(url, tabId, productId) {
 }
 
 
-async function stopCollection() {
-  if (currentCollection) {
-    try {
-      await chrome.tabs.sendMessage(currentCollection.tabId, {
-        action: 'stopScraping'
+async function stopCollection(originalTabId = null) {
+  if (originalTabId) {
+    const collection = collectionsByTab.get(originalTabId);
+    if (collection) {
+      try {
+        await chrome.tabs.sendMessage(collection.tabId, {
+          action: 'stopScraping'
+        });
+      } catch (error) {
+        collectionsByTab.delete(originalTabId);
+        const storageKey = `collectionStatus_${originalTabId}`;
+        chrome.storage.local.remove(storageKey);
+      }
+    } else {
+      const storageKey = `collectionStatus_${originalTabId}`;
+      chrome.storage.local.get([storageKey], (result) => {
+        if (result[storageKey] && result[storageKey].isCollecting) {
+          const status = result[storageKey];
+          chrome.tabs.sendMessage(status.tabId, {
+            action: 'stopScraping'
+          }).catch(() => {
+            chrome.storage.local.remove(storageKey);
+          });
+        }
       });
-
-    } catch (error) {
-      currentCollection = null;
-      chrome.storage.local.remove('collectionStatus');
     }
   } else {
     chrome.storage.local.get(['collectionStatus'], (result) => {
@@ -457,13 +526,21 @@ async function stopCollection() {
 
 function convertToExcel(reviews) {
   try {
-    const headers = ['내용', '평점', '날짜'];
+    const headers = ['날짜', '작성자', '별점', '제목', '내용', '상품평가'];
     const rows = reviews.map(review => {
-      const content = (review.content || '').replace(/"/g, '""').replace(/  /g, '\n'); 
+      const date = (review.date || '').replace(/"/g, '""');
+      const author = (review.author || '').replace(/"/g, '""');
+      const rating = (review.rating || '').replace(/"/g, '""');
+      const title = (review.title || '').replace(/"/g, '""').replace(/\n/g, ' ');
+      const content = (review.content || '').replace(/"/g, '""').replace(/\n/g, ' ');
+      const productEvaluation = (review.productEvaluation || '').replace(/"/g, '""').replace(/\n/g, ' ');
       return [
+        date,
+        author,
+        rating,
+        title,
         content,
-        review.rating || '',
-        review.date || ''
+        productEvaluation
       ];
     });
 
