@@ -33,7 +33,7 @@
 
     console.log('[UI] 새 UI 생성 시작...');
 
-    // 배경 오버레이 생성
+    // 배경 오버레이 생성 (투명하게, 클릭 이벤트만 처리)
     overlay = document.createElement('div');
     overlay.id = 'crc-ui-overlay';
     overlay.style.cssText = `
@@ -42,66 +42,67 @@
       left: 0;
       width: 100%;
       height: 100%;
-      background: rgba(0, 0, 0, 0.5);
+      background: transparent;
       z-index: 9999;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      pointer-events: none;
     `;
 
-    // UI 컨테이너 생성 (모달 창 형태로 더 크게)
+    // UI 컨테이너 생성 (상단 우측 구석의 작은 창)
     uiContainer = document.createElement('div');
     uiContainer.id = 'coupang-review-collector-ui';
     uiContainer.style.cssText = `
-      position: relative;
-      width: 700px;
-      max-width: 90vw;
-      max-height: 85vh;
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      width: 400px;
+      max-width: calc(100vw - 40px);
+      max-height: calc(100vh - 40px);
       background: white;
       border: 2px solid #667eea;
       border-radius: 12px;
       box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
       z-index: 10000;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      font-size: 14px;
+      font-size: 13px;
       overflow: hidden;
       display: flex;
       flex-direction: column;
+      pointer-events: auto;
     `;
 
-    // 헤더
+    // 헤더 (작게)
     const header = document.createElement('div');
     header.style.cssText = `
       background: #667eea;
       color: white;
-      padding: 15px;
+      padding: 10px 12px;
       font-weight: 600;
-      font-size: 16px;
+      font-size: 14px;
       display: flex;
       justify-content: space-between;
       align-items: center;
     `;
     header.innerHTML = `
-      <span>🛒 쿠팡 리뷰 수집기</span>
-      <button id="crc-ui-close" style="background: transparent; border: none; color: white; cursor: pointer; font-size: 20px; padding: 0; width: 24px; height: 24px;">✕</button>
+      <span>🛒 리뷰 수집기</span>
+      <button id="crc-ui-close" style="background: transparent; border: none; color: white; cursor: pointer; font-size: 18px; padding: 0; width: 20px; height: 20px; line-height: 1;">✕</button>
     `;
 
-    // 상태 표시 영역
+    // 상태 표시 영역 (작게)
     statusDiv = document.createElement('div');
     statusDiv.id = 'crc-ui-status';
     statusDiv.style.cssText = `
-      padding: 12px 15px;
+      padding: 8px 12px;
       background: #d1ecf1;
       color: #0c5460;
       border-bottom: 1px solid #bee5eb;
-      font-size: 13px;
+      font-size: 12px;
     `;
     statusDiv.textContent = '리뷰 수집 준비 중...';
 
-    // 진행률 표시
+    // 진행률 표시 (작게)
     const progressContainer = document.createElement('div');
     progressContainer.style.cssText = `
-      padding: 15px;
+      padding: 10px 12px;
       border-bottom: 1px solid #e0e0e0;
     `;
     const progressBar = document.createElement('div');
@@ -126,7 +127,7 @@
     progressText.id = 'crc-ui-progress-text';
     progressText.style.cssText = `
       text-align: center;
-      font-size: 12px;
+      font-size: 11px;
       color: #666;
       font-weight: 500;
     `;
@@ -134,14 +135,14 @@
     progressContainer.appendChild(progressBar);
     progressContainer.appendChild(progressText);
 
-    // 로그 헤더
+    // 로그 헤더 (작게)
     const logHeader = document.createElement('div');
     logHeader.style.cssText = `
-      padding: 12px 15px;
+      padding: 8px 12px;
       background: #e9ecef;
       border-top: 1px solid #e0e0e0;
       border-bottom: 1px solid #e0e0e0;
-      font-size: 14px;
+      font-size: 12px;
       font-weight: 600;
       color: #495057;
       display: flex;
@@ -150,27 +151,27 @@
     `;
     logHeader.innerHTML = `
       <span>진행 로그</span>
-      <button id="crc-ui-clear-log" style="background: transparent; border: none; color: #6c757d; cursor: pointer; font-size: 14px; padding: 4px 8px; border-radius: 4px;">지우기</button>
+      <button id="crc-ui-clear-log" style="background: transparent; border: none; color: #6c757d; cursor: pointer; font-size: 12px; padding: 2px 6px; border-radius: 4px;">지우기</button>
     `;
 
-    // 로그 영역 (더 크게)
+    // 로그 영역 (작게)
     logContainer = document.createElement('div');
     logContainer.id = 'crc-ui-logs';
     logContainer.style.cssText = `
       flex: 1;
       overflow-y: auto;
-      padding: 15px;
-      font-size: 13px;
+      padding: 10px;
+      font-size: 12px;
       font-family: 'Courier New', monospace;
-      max-height: 400px;
-      min-height: 300px;
+      max-height: 250px;
+      min-height: 150px;
       background: #f8f9fa;
     `;
 
-    // 중지 버튼 영역
+    // 중지 버튼 영역 (작게)
     const buttonContainer = document.createElement('div');
     buttonContainer.style.cssText = `
-      padding: 12px 15px;
+      padding: 8px 12px;
       border-top: 1px solid #e0e0e0;
       background: white;
       display: flex;
@@ -180,16 +181,16 @@
     stopButton.id = 'crc-ui-stop-btn';
     stopButton.textContent = '⏹ 중지';
     stopButton.style.cssText = `
-      padding: 10px 20px;
+      padding: 6px 16px;
       background: #dc3545;
       color: white;
       border: none;
       border-radius: 6px;
-      font-size: 14px;
+      font-size: 12px;
       font-weight: 600;
       cursor: pointer;
       transition: background 0.2s;
-      min-width: 100px;
+      min-width: 80px;
     `;
     stopButton.addEventListener('mouseenter', () => {
       stopButton.style.background = '#c82333';
@@ -218,13 +219,14 @@
     uiContainer.appendChild(logHeader);
     uiContainer.appendChild(logContainer);
     uiContainer.appendChild(buttonContainer);
-    overlay.appendChild(uiContainer);
-    document.body.appendChild(overlay);
+    // uiContainer를 직접 body에 추가 (상단 우측 구석에 위치)
+    document.body.appendChild(uiContainer);
     console.log('[UI] UI 컨테이너가 페이지에 추가됨');
 
     // 닫기 버튼
     document.getElementById('crc-ui-close').addEventListener('click', () => {
-      overlay.remove();
+      if (uiContainer) uiContainer.remove();
+      if (overlay) overlay.remove();
       isUICreated = false;
     });
 
@@ -240,13 +242,7 @@
       }
     });
 
-    // 배경 오버레이 클릭 시 닫기
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) {
-        overlay.remove();
-        isUICreated = false;
-      }
-    });
+    // 배경 오버레이 클릭 시 닫기 기능 제거 (상단 구석 창이므로)
 
     isUICreated = true;
     addLog('리뷰 수집 UI가 준비되었습니다.', 'info');
@@ -274,14 +270,14 @@
     const time = new Date().toLocaleTimeString('ko-KR');
     const logEntry = document.createElement('div');
     logEntry.style.cssText = `
-      margin-bottom: 8px;
-      padding: 6px 0;
+      margin-bottom: 4px;
+      padding: 4px 0;
       border-bottom: 1px solid #e9ecef;
-      line-height: 1.6;
+      line-height: 1.4;
     `;
 
     const timeSpan = document.createElement('span');
-    timeSpan.style.cssText = 'color: #6c757d; font-size: 12px; margin-right: 10px; font-weight: 500;';
+    timeSpan.style.cssText = 'color: #6c757d; font-size: 11px; margin-right: 8px; font-weight: 500;';
     timeSpan.textContent = `[${time}]`;
 
     const messageSpan = document.createElement('span');
@@ -292,7 +288,7 @@
       error: '#721c24'
     };
     messageSpan.style.color = colors[type] || colors.info;
-    messageSpan.style.fontSize = '13px';
+    messageSpan.style.fontSize = '12px';
     messageSpan.textContent = message;
 
     logEntry.appendChild(timeSpan);
@@ -322,14 +318,14 @@
               const time = log.time || new Date().toLocaleTimeString('ko-KR');
               const logEntry = document.createElement('div');
               logEntry.style.cssText = `
-                margin-bottom: 8px;
-                padding: 6px 0;
+                margin-bottom: 4px;
+                padding: 4px 0;
                 border-bottom: 1px solid #e9ecef;
-                line-height: 1.6;
+                line-height: 1.4;
               `;
 
               const timeSpan = document.createElement('span');
-              timeSpan.style.cssText = 'color: #6c757d; font-size: 12px; margin-right: 10px; font-weight: 500;';
+              timeSpan.style.cssText = 'color: #6c757d; font-size: 11px; margin-right: 8px; font-weight: 500;';
               timeSpan.textContent = `[${time}]`;
 
               const messageSpan = document.createElement('span');
@@ -340,7 +336,7 @@
                 error: '#721c24'
               };
               messageSpan.style.color = colors[log.type] || colors.info;
-              messageSpan.style.fontSize = '13px';
+              messageSpan.style.fontSize = '12px';
               messageSpan.textContent = log.message;
 
               logEntry.appendChild(timeSpan);

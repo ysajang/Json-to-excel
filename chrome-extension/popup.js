@@ -96,11 +96,6 @@ if (startBtn) {
     productId = tempProductId;
     isCollecting = true;
 
-    // 선택된 별점 필터 가져오기
-    const ratingFilterSelect = document.getElementById('ratingFilter');
-    const selectedRating = ratingFilterSelect ? ratingFilterSelect.value : '';
-    const selectedRatings = selectedRating ? [selectedRating] : null;
-
     // UI 업데이트
     startBtn.disabled = true;
     startBtn.classList.add('hidden');
@@ -109,13 +104,8 @@ if (startBtn) {
     resultsDiv.classList.add('hidden');
     statusDiv.classList.remove('hidden');
     // 로그는 새 탭의 모달 창에 표시됨
-    if (selectedRatings && selectedRatings.length > 0) {
-      addLog(`리뷰 수집을 시작합니다... (${selectedRatings[0]}점만 수집)`, 'info');
-      showStatus(`리뷰 수집을 시작합니다... (${selectedRatings[0]}점만 수집)`, 'info');
-    } else {
-      addLog('리뷰 수집을 시작합니다...', 'info');
-      showStatus('리뷰 수집을 시작합니다...', 'info');
-    }
+    addLog('리뷰 수집을 시작합니다...', 'info');
+    showStatus('리뷰 수집을 시작합니다...', 'info');
     updateProgress(0, '초기화 중...');
 
     // 진행 상황 수신 리스너 설정 (먼저 설정)
@@ -144,8 +134,7 @@ if (startBtn) {
             action: 'startCollection',
             url: url,
             productId: productId,
-            originalTabId: currentTabId, // 현재 활성 탭 ID 전달
-            ratingFilter: selectedRatings && selectedRatings.length > 0 ? selectedRatings : null // 별점 필터 전달
+            originalTabId: currentTabId // 현재 활성 탭 ID 전달
           },
           (bgResponse) => {
             if (chrome.runtime.lastError) {
@@ -617,9 +606,9 @@ function setupMessageListener() {
       chrome.runtime.onMessage.removeListener(window.messageListener);
       window.messageListener = null;
     } else if (message.action === 'stopped') {
-      // 즉시 중지 메시지 (별점 필터로 인한 종료 포함)
+      // 즉시 중지 메시지
       if (message.reviews !== undefined) {
-        // 리뷰 데이터가 포함된 경우 (별점 필터로 인한 종료)
+        // 리뷰 데이터가 포함된 경우
         collectedReviews = message.reviews || [];
         addLog(`수집 종료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'warning');
         showStatus(message.message || `수집 종료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'info');
