@@ -296,6 +296,98 @@ downloadExcelBtn.addEventListener('click', async () => {
 });
 
 
+// 테이블 복사 기능
+if (copyTableBtn) {
+  copyTableBtn.addEventListener('click', async () => {
+    if (!filteredReviews || filteredReviews.length === 0) {
+      showStatus('복사할 리뷰가 없습니다.', 'error');
+      return;
+    }
+
+    // 테이블 헤더 생성
+    const headers = ['번호', '날짜', '작성자', '평점', '제목', '내용', '상품평가'];
+
+    // 모든 리뷰 데이터를 텍스트로 변환 (현재 페이지가 아닌 전체)
+    const rows = filteredReviews.map((review, index) => {
+      const date = review.date || '날짜 없음';
+      const author = review.author || '작성자 없음';
+      const rating = parseInt(review.rating) || 0;
+      const title = review.title || '(제목 없음)';
+      const content = review.content || '(내용 없음)';
+      const productEvaluation = review.productEvaluation || '(평가 없음)';
+
+      // 탭으로 구분된 텍스트 형식
+      return [
+        (index + 1).toString(),
+        date,
+        author,
+        `${rating}점`,
+        title.replace(/\t/g, ' ').replace(/\n/g, ' '),
+        content.replace(/\t/g, ' ').replace(/\n/g, ' '),
+        productEvaluation.replace(/\t/g, ' ').replace(/\n/g, ' ')
+      ].join('\t');
+    });
+
+    // 헤더와 데이터 결합
+    const tableText = [
+      headers.join('\t'),
+      ...rows
+    ].join('\n');
+
+    try {
+      // 클립보드에 복사
+      await navigator.clipboard.writeText(tableText);
+
+      // 성공 메시지 표시
+      const originalText = copyTableBtn.textContent;
+      copyTableBtn.textContent = '✓ 복사됨';
+      copyTableBtn.disabled = true;
+      showStatus(`테이블이 클립보드에 복사되었습니다. (${filteredReviews.length}개 리뷰)`, 'success');
+
+      // 2초 후 원래 텍스트로 복원
+      setTimeout(() => {
+        copyTableBtn.textContent = originalText;
+        copyTableBtn.disabled = false;
+      }, 2000);
+    } catch (error) {
+      console.error('복사 실패:', error);
+
+      // 대체 방법: 텍스트 영역 사용
+      try {
+        const textArea = document.createElement('textarea');
+        textArea.value = tableText;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        textArea.style.top = '0';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+
+        const successful = document.execCommand('copy');
+        document.body.removeChild(textArea);
+
+        if (successful) {
+          const originalText = copyTableBtn.textContent;
+          copyTableBtn.textContent = '✓ 복사됨';
+          copyTableBtn.disabled = true;
+          showStatus(`테이블이 클립보드에 복사되었습니다. (${filteredReviews.length}개 리뷰, 대체 방법)`, 'success');
+
+          setTimeout(() => {
+            copyTableBtn.textContent = originalText;
+            copyTableBtn.disabled = false;
+          }, 2000);
+        } else {
+          showStatus('복사 실패: 클립보드 접근 권한이 필요합니다.', 'error');
+        }
+      } catch (fallbackError) {
+        console.error('대체 복사 방법 실패:', fallbackError);
+        showStatus('복사 실패: 클립보드 접근 권한이 필요합니다.', 'error');
+      }
+    }
+  });
+}
+
+
 function showStatus(message, type) {
   statusDiv.textContent = message;
   statusDiv.className = `status ${type}`;
