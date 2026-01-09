@@ -196,16 +196,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (collection && collection.collectionTabId) {
-      try {
-        chrome.tabs.sendMessage(collection.collectionTabId, {
-          action: 'complete',
-          reviews: request.reviews,
-          stopped: request.stopped || false
-        }).catch((err) => {
-        });
-      } catch (err) {
-      }
-
       // 알림만 표시하고 바로 탭 닫기 (진행률 표시 없음)
       try {
         chrome.tabs.sendMessage(collection.collectionTabId, {
@@ -218,18 +208,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       } catch (err) {
       }
 
-      // 바로 탭 닫기 (대기 시간 없음)
-      chrome.tabs.remove(collection.collectionTabId).then(() => {
-        // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
-        if (originalTabId) {
-          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
-              chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
-            }
-          });
-        }
-      }).catch(err => {
-      });
+      // 알림 표시를 위한 짧은 대기 후 바로 탭 닫기
+      setTimeout(() => {
+        chrome.tabs.remove(collection.collectionTabId).then(() => {
+          // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
+          if (originalTabId) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+              if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
+                chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
+              }
+            });
+          }
+        }).catch(err => {
+        });
+      }, 500); // 알림 표시를 위한 최소 대기 시간 (0.5초)
     }
   } else if (request.action === 'stopped') {
     const originalTabId = request.originalTabId || null;
