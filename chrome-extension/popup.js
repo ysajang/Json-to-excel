@@ -1,6 +1,7 @@
 
 const productUrlInput = document.getElementById('productUrl');
-const ratingFilterSelect = document.getElementById('ratingFilter');
+const ratingFilterSelect = document.getElementById('ratingFilter'); // 레거시 (제거 예정)
+const ratingCheckboxes = document.querySelectorAll('.rating-checkbox');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const statusDiv = document.getElementById('status');
@@ -21,6 +22,7 @@ let filteredReviews = null;
 let currentPage = 1;
 const itemsPerPage = 10;
 let currentTabId = null;
+let selectedRatingFilters = []; // 선택된 별점 필터 저장
 
 
 function addLog(message, type = 'info') {
@@ -117,14 +119,29 @@ if (startBtn) {
       }
 
       try {
-        const ratingFilter = ratingFilterSelect ? ratingFilterSelect.value : 'all';
+        // 체크박스에서 선택된 별점 필터 가져오기
+        const selectedRatings = Array.from(ratingCheckboxes)
+          .filter(cb => cb.checked && cb.value !== 'all')
+          .map(cb => cb.value);
+
+        // '모든 별점'이 선택되었거나 아무것도 선택되지 않았으면 'all'로 설정
+        const allCheckbox = document.getElementById('rating-all');
+        const allChecked = allCheckbox && allCheckbox.checked;
+        const ratingFilter = (allChecked || selectedRatings.length === 0) ? 'all' : selectedRatings.join(',');
+
+        // 선택된 별점 필터 저장 (수집 후 필터링용)
+        selectedRatingFilters = selectedRatings.length > 0 ? selectedRatings : [];
+
+        addLog(`선택된 별점 필터: ${ratingFilter === 'all' ? '모든 별점' : selectedRatings.map(r => `${r}점`).join(', ')}`, 'info');
+
         chrome.runtime.sendMessage(
           {
             action: 'startCollection',
             url: url,
             productId: productId,
             originalTabId: currentTabId,
-            ratingFilter: ratingFilter
+            ratingFilter: ratingFilter,
+            selectedRatings: selectedRatings // 선택된 별점 배열 전달
           },
           (bgResponse) => {
             if (chrome.runtime.lastError) {
@@ -182,7 +199,7 @@ stopBtn.addEventListener('click', async () => {
             resetUI();
             showStatus('수집이 중지되었습니다.', 'info');
           }
-        }, 10000);
+        }, 2000);
       }
     });
   } catch (error) {
@@ -281,7 +298,7 @@ downloadExcelBtn.addEventListener('click', async () => {
       }, (downloadId) => {
         setTimeout(() => {
           URL.revokeObjectURL(url);
-        }, 1000);
+        }, 500);
 
         if (chrome.runtime.lastError) {
           showStatus('다운로드 실패: ' + chrome.runtime.lastError.message, 'error');
@@ -309,12 +326,12 @@ if (copyTableBtn) {
 
     // 모든 리뷰 데이터를 텍스트로 변환 (현재 페이지가 아닌 전체)
     const rows = filteredReviews.map((review, index) => {
-      const date = review.date || '날짜 없음';
-      const author = review.author || '작성자 없음';
+      const date = review.date || '';
+      const author = review.author || '';
       const rating = parseInt(review.rating) || 0;
-      const title = review.title || '(제목 없음)';
-      const content = review.content || '(내용 없음)';
-      const productEvaluation = review.productEvaluation || '(평가 없음)';
+      const title = review.title || '';
+      const content = review.content || '';
+      const productEvaluation = review.productEvaluation || '';
 
       // 탭으로 구분된 텍스트 형식
       return [
@@ -512,6 +529,15 @@ async function loadReviewsForCurrentTab() {
     if (result[storageKey] && result[storageKey].reviews) {
       const collectionData = result[storageKey];
       collectedReviews = collectionData.reviews;
+
+      // 선택된 별점 필터가 있으면 필터링 적용
+      if (selectedRatingFilters.length > 0) {
+        collectedReviews = collectedReviews.filter(review => {
+          const reviewRating = review.rating ? review.rating.toString() : '';
+          return selectedRatingFilters.includes(reviewRating);
+        });
+      }
+
       const isStopped = collectionData.stopped || false;
       filteredReviews = [...collectedReviews];
       showResults(collectedReviews.length, isStopped);
@@ -519,6 +545,15 @@ async function loadReviewsForCurrentTab() {
     // 현재 탭에 데이터가 없으면 lastCollection 확인
     else if (result.lastCollection && result.lastCollection.reviews) {
       collectedReviews = result.lastCollection.reviews;
+
+      // 선택된 별점 필터가 있으면 필터링 적용
+      if (selectedRatingFilters.length > 0) {
+        collectedReviews = collectedReviews.filter(review => {
+          const reviewRating = review.rating ? review.rating.toString() : '';
+          return selectedRatingFilters.includes(reviewRating);
+        });
+      }
+
       const isStopped = result.lastCollection.stopped || false;
       filterReviewsByCurrentTab();
       const displayCount = filteredReviews ? filteredReviews.length : 0;
@@ -605,22 +640,40 @@ function restoreState() {
           const keysToGet = storageKey ? [storageKey, 'lastCollection'] : ['lastCollection'];
 
           chrome.storage.local.get(keysToGet, (result) => {
-            // 현재 탭의 데이터를 우선적으로 확인
-            if (storageKey && result[storageKey] && result[storageKey].reviews) {
-              const collectionData = result[storageKey];
-              collectedReviews = collectionData.reviews;
-              const isStopped = collectionData.stopped || false;
-              filteredReviews = [...collectedReviews];
-              showResults(collectedReviews.length, isStopped);
+          // 현재 탭의 데이터를 우선적으로 확인
+          if (storageKey && result[storageKey] && result[storageKey].reviews) {
+            const collectionData = result[storageKey];
+            collectedReviews = collectionData.reviews;
+
+            // 선택된 별점 필터가 있으면 필터링 적용
+            if (selectedRatingFilters.length > 0) {
+              collectedReviews = collectedReviews.filter(review => {
+                const reviewRating = review.rating ? review.rating.toString() : '';
+                return selectedRatingFilters.includes(reviewRating);
+              });
             }
-            // 현재 탭에 데이터가 없으면 lastCollection 확인
-            else if (result.lastCollection && result.lastCollection.reviews) {
-              collectedReviews = result.lastCollection.reviews;
-              const isStopped = result.lastCollection.stopped || false;
-              filterReviewsByCurrentTab();
-              const displayCount = filteredReviews ? filteredReviews.length : 0;
-              showResults(displayCount, isStopped);
+
+            const isStopped = collectionData.stopped || false;
+            filteredReviews = [...collectedReviews];
+            showResults(collectedReviews.length, isStopped);
+          }
+          // 현재 탭에 데이터가 없으면 lastCollection 확인
+          else if (result.lastCollection && result.lastCollection.reviews) {
+            collectedReviews = result.lastCollection.reviews;
+
+            // 선택된 별점 필터가 있으면 필터링 적용
+            if (selectedRatingFilters.length > 0) {
+              collectedReviews = collectedReviews.filter(review => {
+                const reviewRating = review.rating ? review.rating.toString() : '';
+                return selectedRatingFilters.includes(reviewRating);
+              });
             }
+
+            const isStopped = result.lastCollection.stopped || false;
+            filterReviewsByCurrentTab();
+            const displayCount = filteredReviews ? filteredReviews.length : 0;
+            showResults(displayCount, isStopped);
+          }
             resolve();
           });
         });
@@ -651,11 +704,22 @@ function setupMessageListener() {
     } else if (message.action === 'complete') {
       collectedReviews = message.reviews;
       const isStopped = message.stopped || false;
-      addLog(`수집 완료: 총 ${message.reviews.length}개의 리뷰가 수집되었습니다.`, 'success');
-      if (isStopped) {
-        showStatus(`수집이 중지되었습니다. 현재까지 ${message.reviews.length}개의 리뷰가 수집되었습니다.`, 'info');
+
+      // 선택된 별점 필터가 있으면 필터링 적용
+      if (selectedRatingFilters.length > 0) {
+        collectedReviews = collectedReviews.filter(review => {
+          const reviewRating = review.rating ? review.rating.toString() : '';
+          return selectedRatingFilters.includes(reviewRating);
+        });
+        addLog(`수집 완료: 총 ${message.reviews.length}개 중 선택한 별점(${selectedRatingFilters.join(',')}점) ${collectedReviews.length}개 리뷰`, 'success');
       } else {
-        showStatus(`수집 완료! 총 ${message.reviews.length}개의 리뷰가 수집되었습니다.`, 'success');
+        addLog(`수집 완료: 총 ${message.reviews.length}개의 리뷰가 수집되었습니다.`, 'success');
+      }
+
+      if (isStopped) {
+        showStatus(`수집이 중지되었습니다. 현재까지 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'info');
+      } else {
+        showStatus(`수집 완료! 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'success');
       }
       filterReviewsByCurrentTab();
       const displayCount = filteredReviews ? filteredReviews.length : 0;
@@ -690,6 +754,34 @@ function setupMessageListener() {
   chrome.runtime.onMessage.addListener(window.messageListener);
 }
 
+
+// '모든 별점' 체크박스 변경 시 다른 체크박스 처리
+if (ratingCheckboxes.length > 0) {
+  const allCheckbox = document.getElementById('rating-all');
+  if (allCheckbox) {
+    allCheckbox.addEventListener('change', (e) => {
+      if (e.target.checked) {
+        // '모든 별점'이 체크되면 다른 체크박스 모두 해제
+        ratingCheckboxes.forEach(cb => {
+          if (cb.value !== 'all') {
+            cb.checked = false;
+          }
+        });
+      }
+    });
+  }
+
+  // 다른 체크박스 변경 시 '모든 별점' 해제
+  ratingCheckboxes.forEach(cb => {
+    if (cb.value !== 'all') {
+      cb.addEventListener('change', (e) => {
+        if (e.target.checked && allCheckbox) {
+          allCheckbox.checked = false;
+        }
+      });
+    }
+  });
+}
 
 restoreState().then(() => {
   if (!isCollecting) {

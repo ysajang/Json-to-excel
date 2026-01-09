@@ -63,6 +63,50 @@ input[type="text"] {
   transition: border-color 0.3s;
 }
 
+.rating-filter-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.rating-checkbox-label {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+  padding: 8px 12px;
+  border: 2px solid #ddd;
+  border-radius: 6px;
+  background: white;
+  transition: all 0.2s;
+  font-size: 14px;
+}
+
+.rating-checkbox-label:hover {
+  border-color: #667eea;
+  background: #f0f4ff;
+}
+
+.rating-checkbox-label input[type="checkbox"]:checked + span {
+  font-weight: 600;
+  color: #667eea;
+}
+
+.rating-checkbox-label input[type="checkbox"]:checked ~ span,
+.rating-checkbox-label:has(input[type="checkbox"]:checked) {
+  border-color: #667eea;
+  background: #e8edff;
+}
+
+.rating-checkbox {
+  margin-right: 6px;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: #667eea;
+}
+
 .rating-select {
   width: 100%;
   padding: 12px;
