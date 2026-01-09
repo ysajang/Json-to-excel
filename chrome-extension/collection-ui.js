@@ -324,6 +324,15 @@
     }
 
     if (request.action === 'progress') {
+      // 알림만 표시 모드인 경우 진행률 업데이트하지 않음
+      if (request.showNotificationOnly) {
+        // 진행률은 표시하지 않고 로그만 추가
+        if (request.log) {
+          addLog(request.log, request.logType || 'info');
+        }
+        return;
+      }
+
       const percent = request.percent || 0;
       if (progressFill) progressFill.style.width = percent + '%';
       if (progressText) progressText.textContent = request.text || `${percent}%`;
@@ -346,23 +355,60 @@
     } else if (request.action === 'complete') {
       const reviewCount = request.reviews?.length || 0;
 
-      if (statusDiv) {
-        statusDiv.textContent = `✅ 수집 완료! 총 ${reviewCount}개의 리뷰가 수집되었습니다.`;
-        statusDiv.style.background = '#d4edda';
-        statusDiv.style.color = '#155724';
-      }
+      // 알림만 표시 모드인 경우 진행률 표시하지 않음
+      if (request.showNotificationOnly) {
+        // 진행률 바 숨기기
+        const progressContainer = document.querySelector('#coupang-review-collector-ui > div:nth-child(3)');
+        if (progressContainer) {
+          progressContainer.style.display = 'none';
+        }
 
-      if (progressFill) progressFill.style.width = '100%';
-      if (progressText) progressText.textContent = '100%';
+        // 알림만 표시
+        if (statusDiv) {
+          statusDiv.textContent = `✅ 수집 완료! 총 ${reviewCount}개의 리뷰가 수집되었습니다.`;
+          statusDiv.style.background = '#d4edda';
+          statusDiv.style.color = '#155724';
+          statusDiv.style.fontSize = '14px';
+          statusDiv.style.fontWeight = '600';
+          statusDiv.style.padding = '12px';
+        }
 
-      if (logContainer) {
-        addLog(`✅ 수집 완료: 총 ${reviewCount}개 리뷰가 수집되었습니다.`, 'success');
-        addLog(`📊 수집된 리뷰 데이터가 저장되었습니다.`, 'info');
+        // 로그에 간단한 알림만 추가
+        if (logContainer) {
+          addLog(`✅ 수집 완료: 총 ${reviewCount}개 리뷰`, 'success');
+        } else {
+          logContainer = document.getElementById('crc-ui-logs');
+          if (logContainer) {
+            addLog(`✅ 수집 완료: 총 ${reviewCount}개 리뷰`, 'success');
+          }
+        }
+
+        // UI를 자동으로 닫기 (3초 후)
+        setTimeout(() => {
+          if (uiContainer) uiContainer.remove();
+          if (overlay) overlay.remove();
+          isUICreated = false;
+        }, 3000);
       } else {
-        logContainer = document.getElementById('crc-ui-logs');
+        // 기존 동작 (진행률 표시 포함)
+        if (statusDiv) {
+          statusDiv.textContent = `✅ 수집 완료! 총 ${reviewCount}개의 리뷰가 수집되었습니다.`;
+          statusDiv.style.background = '#d4edda';
+          statusDiv.style.color = '#155724';
+        }
+
+        if (progressFill) progressFill.style.width = '100%';
+        if (progressText) progressText.textContent = '100%';
+
         if (logContainer) {
           addLog(`✅ 수집 완료: 총 ${reviewCount}개 리뷰가 수집되었습니다.`, 'success');
           addLog(`📊 수집된 리뷰 데이터가 저장되었습니다.`, 'info');
+        } else {
+          logContainer = document.getElementById('crc-ui-logs');
+          if (logContainer) {
+            addLog(`✅ 수집 완료: 총 ${reviewCount}개 리뷰가 수집되었습니다.`, 'success');
+            addLog(`📊 수집된 리뷰 데이터가 저장되었습니다.`, 'info');
+          }
         }
       }
     } else if (request.action === 'error') {

@@ -47,7 +47,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
               chrome.storage.local.remove(storageKey);
             });
-        }, 2000);
+        }, 500);
       }).catch(error => {
         if (originalTabId) {
           collectionsByTab.delete(originalTabId);
@@ -206,35 +206,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       } catch (err) {
       }
 
+      // 알림만 표시하고 바로 탭 닫기 (진행률 표시 없음)
       try {
-        chrome.runtime.sendMessage({
-          action: 'log',
-          message: '리뷰 수집 완료. 새 탭을 닫습니다...',
-          type: 'info'
-        }).catch(() => {});
-      } catch (e) {}
-
-      setTimeout(() => {
-        chrome.tabs.remove(collection.collectionTabId).then(() => {
-          try {
-            chrome.runtime.sendMessage({
-              action: 'log',
-              message: '새 탭이 닫혔습니다.',
-              type: 'success'
-            }).catch(() => {});
-          } catch (e) {}
-
-          // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
-          if (originalTabId) {
-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-              if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
-                chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
-              }
-            });
-          }
-        }).catch(err => {
+        chrome.tabs.sendMessage(collection.collectionTabId, {
+          action: 'complete',
+          reviews: request.reviews,
+          stopped: request.stopped || false,
+          showNotificationOnly: true // 알림만 표시 플래그
+        }).catch((err) => {
         });
-      }, 2000);
+      } catch (err) {
+      }
+
+      // 바로 탭 닫기 (대기 시간 없음)
+      chrome.tabs.remove(collection.collectionTabId).then(() => {
+        // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
+        if (originalTabId) {
+          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
+              chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
+            }
+          });
+        }
+      }).catch(err => {
+      });
     }
   } else if (request.action === 'stopped') {
     const originalTabId = request.originalTabId || null;
