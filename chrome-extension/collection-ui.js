@@ -383,12 +383,18 @@
           }
         }
 
-        // UI를 자동으로 닫기 (3초 후)
+        // UI를 자동으로 닫기 (2초 후 - 탭이 닫히기 전에 알림 확인 가능)
         setTimeout(() => {
-          if (uiContainer) uiContainer.remove();
-          if (overlay) overlay.remove();
-          isUICreated = false;
-        }, 3000);
+          if (uiContainer) {
+            uiContainer.style.opacity = '0';
+            uiContainer.style.transition = 'opacity 0.3s';
+            setTimeout(() => {
+              if (uiContainer) uiContainer.remove();
+              if (overlay) overlay.remove();
+              isUICreated = false;
+            }, 300);
+          }
+        }, 2000);
       } else {
         // 기존 동작 (진행률 표시 포함)
         if (statusDiv) {
