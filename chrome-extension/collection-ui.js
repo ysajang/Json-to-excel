@@ -358,7 +358,7 @@
       // 알림만 표시 모드인 경우 진행률 표시하지 않음
       if (request.showNotificationOnly) {
         // 진행률 바 숨기기
-        const progressContainer = document.querySelector('#coupang-review-collector-ui > div:nth-child(3)');
+        const progressContainer = uiContainer ? uiContainer.querySelector('div:nth-child(3)') : null;
         if (progressContainer) {
           progressContainer.style.display = 'none';
         }
