@@ -1,6 +1,3 @@
-// 쿠팡 리뷰 수집 Content Script
-
-// UI 스크립트 주입
 (function () {
   const script = document.createElement('script');
   script.src = chrome.runtime.getURL('collection-ui.js');
@@ -8,21 +5,16 @@
     this.remove();
   };
   script.onerror = function () {
-    // UI 스크립트 로드 실패 시 무시
   };
   (document.head || document.documentElement).appendChild(script);
 })();
 
-// 전역 변수 선언 (함수보다 먼저 선언)
 let isScraping = false;
 let stopScraping = false;
-let currentOriginalTabId = null; // 현재 수집 작업의 originalTabId 저장
-let currentCollectedReviews = []; // 현재까지 수집한 리뷰 저장 (중지 시 전달용)
+let currentOriginalTabId = null;
+let currentCollectedReviews = [];
 
-
-// UI에 메시지 전달 헬퍼 함수
 function sendToUI(message) {
-  // 즉시 처리 필요한 메시지만 직접 전달 (stopped, startScraping, complete)
   if (message.action === 'stopped' || message.action === 'startScraping' || message.action === 'complete') {
     try {
       window.postMessage({
@@ -1020,13 +1012,7 @@ if (!window.__coupangReviewScraperLoaded) {
               break;
             }
 
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:1465',message:'extractReviewData 호출 전',data:{elementIndex:i+1,elementTextLength:element.textContent?.length||0,elementHTMLPreview:element.innerHTML?.substring(0,200)||''},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-            // #endregion
             const review = extractReviewData(element);
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:1467',message:'extractReviewData 결과',data:{elementIndex:i+1,hasReview:!!review,hasContent:!!(review?.content),contentLength:review?.content?.length||0,contentPreview:review?.content?.substring(0,100)||'',rating:review?.rating||'',date:review?.date||''},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-            // #endregion
             if (review) {
               // content가 공백이어도 리뷰 추출 (사용자 요청)
               const content = review.content ? review.content.trim() : '';
@@ -1037,13 +1023,6 @@ if (!window.__coupangReviewScraperLoaded) {
               // content를 업데이트 (공백이어도 빈 문자열로 유지)
               review.content = content || '';
               reviews.push(review);
-            } else {
-              // #region agent log
-              fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:1923',message:'리뷰 데이터 추출 실패',data:{elementIndex:i+1,hasReview:!!review,elementHTMLPreview:element.innerHTML?.substring(0,500)||''},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-              // #endregion
-              // extractReviewData 내부에서 이미 경고 로그를 출력하므로 여기서는 간단히만 로그
-              if (i < 3) { // 처음 3개만 상세 로그
-              }
             }
           } catch (error) {
           }
@@ -1090,10 +1069,6 @@ if (!window.__coupangReviewScraperLoaded) {
         return null;
       }
 
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:1980',message:'extractReviewData 시작',data:{elementHTMLPreview:element.innerHTML?.substring(0,1000)||'',elementTextLength:element.textContent?.length||0,elementTextPreview:element.textContent?.substring(0,300)||'',elementTagName:element.tagName,elementClassName:element.className?.substring(0,200)||'',elementId:element.id||'',elementOuterHTML:element.outerHTML?.substring(0,500)||''},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'N'})}).catch(()=>{});
-      // #endregion
-
       let content = '';
       let rating = '';
       let date = '';
@@ -1125,19 +1100,13 @@ if (!window.__coupangReviewScraperLoaded) {
             }
           }
 
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2021',message:'리뷰 내용 선택자 시도',data:{hasContentEl:!!contentEl,contentLength:contentEl?.textContent?.length||0,contentPreview:contentEl?.textContent?.substring(0,200)||'',contentElHTML:contentEl?.innerHTML?.substring(0,300)||'',triedSelectors:contentSelectors.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'N'})}).catch(()=>{});
-          // #endregion
           if (contentEl) {
             content = (contentEl.textContent || '').trim();
           }
 
           // 특정 선택자로 찾지 못한 경우 대체 방법 시도
           if (!content || content.length < 10) {
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:1558',message:'대체 선택자 시도 시작',data:{currentContentLength:content.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-            // #endregion
-            // 더 일반적인 선택자들 시도
+            const alternativeSelectors = [
             const alternativeSelectors = [
               'div[class*="text"][class*="bluegray-900"]',
               'div[class*="break-all"]',
@@ -1152,17 +1121,11 @@ if (!window.__coupangReviewScraperLoaded) {
             for (const selector of alternativeSelectors) {
               try {
                 const altEl = element.querySelector(selector);
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2045',message:'대체 선택자 시도',data:{selector,hasAltEl:!!altEl,altElTextLength:altEl?.textContent?.length||0,altElTextPreview:altEl?.textContent?.substring(0,100)||''},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'N'})}).catch(()=>{});
-                // #endregion
                 if (altEl) {
                   const candidateContent = (altEl.textContent || '').trim();
                   // 더 긴 내용을 우선 선택
                   if (candidateContent && candidateContent.length > content.length && candidateContent.length > 10) {
                     content = candidateContent;
-                    // #region agent log
-                    fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2053',message:'대체 선택자로 내용 추출 성공',data:{selector,contentLength:content.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'N'})}).catch(()=>{});
-                    // #endregion
                     break;
                   }
                 }
@@ -1172,14 +1135,10 @@ if (!window.__coupangReviewScraperLoaded) {
             }
           }
 
-          // 여전히 내용을 찾지 못한 경우, 요소의 직접 텍스트에서 추출 시도
           if (!content || content.length < 10) {
             const directText = (element.textContent || '').trim();
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2071',message:'직접 텍스트 추출 시도',data:{directTextLength:directText.length,directTextPreview:directText.substring(0,300)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'Q'})}).catch(()=>{});
-            // #endregion
 
-            // 모든 div 요소를 찾아서 가장 긴 텍스트를 리뷰 내용으로 사용
+            if (directText.length > 20) {
             if (directText.length > 20) {
               const allDivs = element.querySelectorAll('div');
               let longestText = '';
@@ -1200,28 +1159,15 @@ if (!window.__coupangReviewScraperLoaded) {
 
               if (longestText.length > content.length && longestText.length >= 20) {
                 content = longestText;
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2095',message:'div 요소에서 가장 긴 텍스트 추출 성공',data:{contentLength:content.length,allDivsCount:allDivs.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'Q'})}).catch(()=>{});
-                // #endregion
               } else {
-                // 평점과 날짜를 제외한 나머지 텍스트를 내용으로 사용
                 const lines = directText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-                // 첫 번째와 마지막 줄은 보통 평점/날짜일 가능성이 높으므로 제외
                 if (lines.length > 2) {
-                  // 중간 부분을 내용으로 사용
                   const middleContent = lines.slice(1, -1).join(' ').trim();
                   if (middleContent && middleContent.length > content.length && middleContent.length > 10) {
                     content = middleContent;
-                    // #region agent log
-                    fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2107',message:'직접 텍스트에서 내용 추출 성공',data:{contentLength:content.length,linesCount:lines.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'Q'})}).catch(()=>{});
-                    // #endregion
                   }
                 } else if (directText.length > 20) {
-                  // 줄이 적으면 전체 텍스트 사용 (너무 짧지 않은 경우)
                   content = directText;
-                  // #region agent log
-                  fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2115',message:'전체 텍스트를 내용으로 사용',data:{contentLength:content.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'Q'})}).catch(()=>{});
-                  // #endregion
                 }
               }
             }
@@ -1257,15 +1203,9 @@ if (!window.__coupangReviewScraperLoaded) {
             }
           }
 
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2127',message:'별점 선택자 시도',data:{hasRatingEl:!!ratingEl,ratingElHTML:ratingEl?.innerHTML?.substring(0,500)||'',ratingElText:ratingEl?.textContent?.substring(0,100)||'',ratingElClassName:ratingEl?.className?.substring(0,200)||'',triedSelectors:ratingSelectors.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'N'})}).catch(()=>{});
-          // #endregion
           if (ratingEl) {
             // ratingEl 내부의 i 요소 중 채워진 별만 세기
             const starElements = ratingEl.querySelectorAll('i');
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2162',message:'별점 요소 확인',data:{starElementsCount:starElements?.length||0,ratingElText:ratingEl.textContent?.substring(0,50)||'',ratingElHTML:ratingEl.innerHTML?.substring(0,200)||''},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'S'})}).catch(()=>{});
-            // #endregion
             if (starElements && starElements.length > 0) {
               // 채워진 별만 세기 (빈 별은 제외)
               let filledStarCount = 0;
@@ -1319,11 +1259,7 @@ if (!window.__coupangReviewScraperLoaded) {
                 }
               }
 
-              // #region agent log
-              fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:1910',message:'별점 요소 상세 분석',data:{totalStarElements:starElements.length,filledStarCount,starDetails},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'V'})}).catch(()=>{});
-              // #endregion
-
-              // 채워진 별이 있으면 그 개수를 사용, 없으면 전체 개수 사용 (하지만 최대 5개)
+              if (filledStarCount > 0) {
               if (filledStarCount > 0) {
                 rating = filledStarCount.toString();
               } else {
@@ -1426,9 +1362,6 @@ if (!window.__coupangReviewScraperLoaded) {
             }
           }
 
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2169',message:'날짜 선택자 시도',data:{hasDateEl:!!dateEl,dateElText:dateEl?.textContent?.substring(0,100)||'',dateElDatetime:dateEl?.getAttribute('datetime')||''},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'N'})}).catch(()=>{});
-          // #endregion
           if (dateEl) {
             // datetime 속성 우선
             date = dateEl.getAttribute('datetime') || '';
@@ -1458,9 +1391,6 @@ if (!window.__coupangReviewScraperLoaded) {
       } catch (error) {
       }
 
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2202',message:'extractReviewData 최종 결과',data:{contentLength:content.length,contentPreview:content.substring(0,200),rating,date,hasContent:content.length>0,hasRating:!!rating,hasDate:!!date,elementChildrenCount:element.children.length,elementAllTextLength:element.textContent?.length||0},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'N'})}).catch(()=>{});
-      // #endregion
       const review = {
         content: content || '',
         rating: rating || '',

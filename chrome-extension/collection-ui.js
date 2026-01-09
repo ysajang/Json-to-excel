@@ -1,19 +1,9 @@
-// 리뷰 수집 UI (페이지에 주입)
 (function () {
   'use strict';
 
-  console.log('[UI] ========== Collection UI 스크립트 실행 ==========');
-  console.log('[UI] 현재 페이지 URL:', window.location.href);
-
-  // 이미 UI가 주입되어 있는지 확인
   if (document.getElementById('coupang-review-collector-ui')) {
-    console.log('[UI] UI가 이미 주입되어 있음');
     return;
   }
-
-  // UI는 startScraping 메시지를 받았을 때만 생성
-  // 초기에는 UI를 생성하지 않음
-  console.log('[UI] UI 스크립트 로드 완료 (수집 시작 시 UI 생성됨)');
 
   let uiContainer = null;
   let overlay = null;
@@ -24,14 +14,10 @@
   let logContainer = null;
   let stopButton = null;
 
-  // UI 생성 함수
   function createUI() {
     if (isUICreated) {
-      console.log('[UI] UI가 이미 생성되어 있음');
       return;
     }
-
-    console.log('[UI] 새 UI 생성 시작...');
 
     // 배경 오버레이 생성 (투명하게, 클릭 이벤트만 처리)
     overlay = document.createElement('div');
@@ -219,11 +205,8 @@
     uiContainer.appendChild(logHeader);
     uiContainer.appendChild(logContainer);
     uiContainer.appendChild(buttonContainer);
-    // uiContainer를 직접 body에 추가 (상단 우측 구석에 위치)
     document.body.appendChild(uiContainer);
-    console.log('[UI] UI 컨테이너가 페이지에 추가됨');
 
-    // 닫기 버튼
     document.getElementById('crc-ui-close').addEventListener('click', () => {
       if (uiContainer) uiContainer.remove();
       if (overlay) overlay.remove();
@@ -251,13 +234,9 @@
     loadLogsFromStorage();
   }
 
-  // 로그 추가 함수 (storage에서도 불러오기)
   function addLog(message, type = 'info') {
-    // UI가 생성되지 않았으면 생성
     if (!isUICreated) {
-      console.log('[UI] ⚠️ UI가 생성되지 않아 생성 중...');
       createUI();
-      console.log('[UI] ✅ UI 생성 완료');
     }
 
     if (!logContainer) {
@@ -294,15 +273,12 @@
     logEntry.appendChild(timeSpan);
     logEntry.appendChild(messageSpan);
     logContainer.appendChild(logEntry);
-    // 자동 스크롤
     logContainer.scrollTop = logContainer.scrollHeight;
-    // 최대 200개 로그 유지
     while (logContainer.children.length > 200) {
       logContainer.removeChild(logContainer.firstChild);
     }
   }
 
-  // storage에서 로그 불러오기
   function loadLogsFromStorage() {
     if (typeof chrome !== 'undefined' && chrome.storage) {
       chrome.storage.local.get(['collectionLogs'], (result) => {
@@ -344,7 +320,6 @@
               logContainer.appendChild(logEntry);
             });
 
-            // 자동 스크롤
             logContainer.scrollTop = logContainer.scrollHeight;
           }
         }
@@ -352,17 +327,13 @@
     }
   }
 
-  // window.postMessage 리스너 (content script에서 직접 전달)
-  // 주의: 이 스크립트는 page context에서 실행되므로 chrome.runtime API를 사용할 수 없습니다.
   window.addEventListener('message', (event) => {
     if (event.data && event.data.type === 'COUPANG_REVIEW_COLLECTOR') {
       handleUIMessage(event.data.data);
     }
   });
 
-  // UI 메시지 처리 함수
   function handleUIMessage(request) {
-    // UI가 생성되지 않았으면 생성
     if (!isUICreated) {
       createUI();
     }
@@ -440,7 +411,4 @@
       addLog('리뷰 수집을 시작합니다...', 'info');
     }
   }
-
-  console.log('[UI] Collection UI 초기화 완료 (수집 시작 시 UI 생성됨)');
-  console.log('[UI] window.postMessage 리스너 준비됨');
 })();
