@@ -1,7 +1,5 @@
 
 const productUrlInput = document.getElementById('productUrl');
-const ratingFilterSelect = document.getElementById('ratingFilter'); // 레거시 (제거 예정)
-const ratingCheckboxes = document.querySelectorAll('.rating-checkbox');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const statusDiv = document.getElementById('status');
@@ -48,13 +46,37 @@ function loadLogsFromStorage() {
 }
 
 
+/**
+ * 쿠팡 상품 URL에서 쿼리 파라미터를 제거하고 기본 상품 URL만 반환
+ * @param {string} url - 원본 쿠팡 상품 URL
+ * @returns {string} - 정규화된 URL (쿼리 파라미터 제거)
+ */
+function normalizeCoupangUrl(url) {
+  if (!url || typeof url !== 'string') {
+    return url;
+  }
+
+  // 쿠팡 상품 URL 패턴: https://www.coupang.com/vp/products/{상품ID}?...
+  const urlPattern = /^(https?:\/\/[^/]+\/vp\/products\/\d+)/;
+  const match = urlPattern.exec(url);
+  if (match) {
+    return match[1];
+  }
+
+  // 매칭되지 않으면 원본 반환
+  return url;
+}
+
+
 async function loadCurrentPageUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.url) {
       currentTabId = tab.id;
 
-      productUrlInput.value = tab.url;
+      // URL 정규화: 쿼리 파라미터 제거
+      const normalizedUrl = normalizeCoupangUrl(tab.url);
+      productUrlInput.value = normalizedUrl;
 
       productUrlInput.disabled = true;
     }
@@ -65,12 +87,15 @@ async function loadCurrentPageUrl() {
 
 if (startBtn) {
   startBtn.addEventListener('click', async () => {
-    const url = productUrlInput.value.trim();
+    let url = productUrlInput.value.trim();
 
     if (!url) {
       showStatus('쿠팡 상품 URL을 입력해주세요.', 'error');
       return;
     }
+
+    // URL 정규화: 쿼리 파라미터 제거
+    url = normalizeCoupangUrl(url);
 
     if (!url.includes('coupang.com/vp/products/')) {
       showStatus('유효한 쿠팡 상품 URL이 아닙니다.', 'error');
@@ -115,24 +140,51 @@ if (startBtn) {
       const currentTabId = tabs && tabs[0] ? tabs[0].id : null;
 
       if (!currentTabId) {
-        addLog('현재 탭 ID를 가져올 수 없습니다. 새로고침 후 다시 시도해주세요.', 'warning');
+        addLog('현재 탭 ID를 가져올 수 없습니다. 새로고침 후 다시 시도해주세요.', 'info');
       }
 
       try {
         // 체크박스에서 선택된 별점 필터 가져오기
-        const selectedRatings = Array.from(ratingCheckboxes)
-          .filter(cb => cb.checked && cb.value !== 'all')
-          .map(cb => cb.value);
+        const ratingCheckboxes = document.querySelectorAll('input[name="ratingFilter"]:checked');
+        let ratingFilters = [];
 
-        // '모든 별점'이 선택되었거나 아무것도 선택되지 않았으면 'all'로 설정
-        const allCheckbox = document.getElementById('rating-all');
-        const allChecked = allCheckbox && allCheckbox.checked;
-        const ratingFilter = (allChecked || selectedRatings.length === 0) ? 'all' : selectedRatings.join(',');
+        // "모든 별점"이 선택되어 있거나 아무것도 선택되지 않았으면 'all'
+        if (ratingCheckboxes.length === 0 ||
+          Array.from(ratingCheckboxes).some(cb => cb.value === 'all')) {
+          ratingFilters = ['all'];
+        } else {
+          // 선택된 별점들을 배열로 저장 (all 제외)
+          ratingFilters = Array.from(ratingCheckboxes)
+            .map(cb => cb.value)
+            .filter(val => val !== 'all');
+        }
 
-        // 선택된 별점 필터 저장 (수집 후 필터링용)
-        selectedRatingFilters = selectedRatings.length > 0 ? selectedRatings : [];
+        // 여러 별점이 선택된 경우 순차적으로 처리
+        if (ratingFilters.length === 0) {
+          showStatus('별점을 선택해주세요.', 'error');
+          resetUI();
+          return;
+        }
 
-        addLog(`선택된 별점 필터: ${ratingFilter === 'all' ? '모든 별점' : selectedRatings.map(r => `${r}점`).join(', ')}`, 'info');
+        // 여러 필터를 배열로 한 번에 전달하여 하나의 페이지에서 순차 처리
+        const ratingNames = {
+          'all': '모든 별점',
+          '5': '최고(5)',
+          '4': '좋음(4)',
+          '3': '보통(3)',
+          '2': '별로(2)',
+          '1': '나쁨(1)'
+        };
+
+        if (ratingFilters.length > 1) {
+          const filterNames = ratingFilters.map(f => ratingNames[f] || f).join(', ');
+          addLog(`다중 필터 수집 시작: ${filterNames}`, 'info');
+          showStatus(`${ratingFilters.length}개 별점 필터링 후 순차 수집 시작...`, 'info');
+        } else {
+          const filterName = ratingNames[ratingFilters[0]] || ratingFilters[0];
+          addLog(`${filterName} 필터링 후 추출 시작...`, 'info');
+          showStatus(`${filterName} 필터링 후 추출 시작...`, 'info');
+        }
 
         chrome.runtime.sendMessage(
           {
@@ -140,8 +192,8 @@ if (startBtn) {
             url: url,
             productId: productId,
             originalTabId: currentTabId,
-            ratingFilter: ratingFilter,
-            selectedRatings: selectedRatings // 선택된 별점 배열 전달
+            ratingFilters: ratingFilters, // 배열로 전달
+            isMultiFilter: ratingFilters.length > 1
           },
           (bgResponse) => {
             if (chrome.runtime.lastError) {
@@ -153,15 +205,20 @@ if (startBtn) {
             }
 
             if (bgResponse && bgResponse.success) {
-              addLog('수집 작업이 시작되었습니다.', 'success');
-              showStatus('수집이 시작되었습니다. 새 탭에서 진행됩니다...', 'success');
+              if (ratingFilters.length > 1) {
+                addLog(`총 ${ratingFilters.length}개 별점 필터링 후 순차 수집이 시작되었습니다.`, 'success');
+                showStatus(`총 ${ratingFilters.length}개 별점 필터링 후 순차 수집이 시작되었습니다.`, 'success');
+              } else {
+                showStatus('수집이 시작되었습니다. 새 창에서 진행됩니다...', 'success');
+              }
             } else if (bgResponse && !bgResponse.success) {
-              addLog(`수집 시작 실패: ${bgResponse.error || '알 수 없는 오류'}`, 'error');
-              showStatus('오류: ' + (bgResponse.error || '수집을 시작할 수 없습니다.'), 'error');
+              const errorMsg = bgResponse.error || '알 수 없는 오류';
+              addLog(`수집 시작 실패: ${errorMsg}`, 'error');
+              showStatus('오류: ' + errorMsg, 'error');
               resetUI();
             } else {
-              addLog('Background Script 응답이 없습니다. 수집이 시작되었을 수 있습니다.', 'warning');
-              showStatus('수집이 시작되었을 수 있습니다. 새 탭을 확인하세요.', 'info');
+              addLog('Background Script 응답이 없습니다. 수집이 시작되었을 수 있습니다.', 'info');
+              showStatus('수집이 시작되었을 수 있습니다. 새 창을 확인하세요.', 'info');
             }
           }
         );
@@ -730,13 +787,13 @@ function setupMessageListener() {
     } else if (message.action === 'stopped') {
       if (message.reviews !== undefined) {
         collectedReviews = message.reviews || [];
-        addLog(`수집 종료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'warning');
+        addLog(`수집 종료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'info');
         showStatus(message.message || `수집 종료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'info');
         filterReviewsByCurrentTab();
         const displayCount = filteredReviews ? filteredReviews.length : 0;
         showResults(displayCount, true);
       } else {
-        addLog('수집이 중지되었습니다.', 'warning');
+        addLog('수집이 중지되었습니다.', 'info');
         showStatus(message.message || '수집이 중지되었습니다.', 'info');
       }
       resetUI();
@@ -755,31 +812,32 @@ function setupMessageListener() {
 }
 
 
-// '모든 별점' 체크박스 변경 시 다른 체크박스 처리
+// 별점 필터 체크박스 상호작용 로직
+const ratingCheckboxes = document.querySelectorAll('input[name="ratingFilter"]');
 if (ratingCheckboxes.length > 0) {
-  const allCheckbox = document.getElementById('rating-all');
-  if (allCheckbox) {
-    allCheckbox.addEventListener('change', (e) => {
-      if (e.target.checked) {
-        // '모든 별점'이 체크되면 다른 체크박스 모두 해제
-        ratingCheckboxes.forEach(cb => {
-          if (cb.value !== 'all') {
-            cb.checked = false;
+  ratingCheckboxes.forEach(checkbox => {
+    checkbox.addEventListener('change', (e) => {
+      const clickedCheckbox = e.target;
+
+      if (clickedCheckbox.value === 'all') {
+        // "모든 별점"이 선택되면 다른 체크박스 모두 해제
+        if (clickedCheckbox.checked) {
+          ratingCheckboxes.forEach(cb => {
+            if (cb.value !== 'all') {
+              cb.checked = false;
+            }
+          });
+        }
+      } else {
+        // 다른 체크박스가 선택되면 "모든 별점" 해제
+        if (clickedCheckbox.checked) {
+          const allCheckbox = document.getElementById('ratingAll');
+          if (allCheckbox) {
+            allCheckbox.checked = false;
           }
-        });
+        }
       }
     });
-  }
-
-  // 다른 체크박스 변경 시 '모든 별점' 해제
-  ratingCheckboxes.forEach(cb => {
-    if (cb.value !== 'all') {
-      cb.addEventListener('change', (e) => {
-        if (e.target.checked && allCheckbox) {
-          allCheckbox.checked = false;
-        }
-      });
-    }
   });
 }
 
@@ -871,31 +929,34 @@ if (searchInput) {
 }
 
 
-const sortSelect = document.getElementById('sortSelect');
-if (sortSelect) {
-  sortSelect.addEventListener('change', (e) => {
-    if (!collectedReviews) return;
+// 정렬 기준 라디오 버튼 이벤트 리스너
+const sortRadioButtons = document.querySelectorAll('input[name="sortSelect"]');
+if (sortRadioButtons.length > 0) {
+  sortRadioButtons.forEach(radio => {
+    radio.addEventListener('change', (e) => {
+      if (!collectedReviews) return;
 
-    const sortValue = e.target.value;
+      const sortValue = e.target.value;
 
-    filterReviewsByCurrentTab();
+      filterReviewsByCurrentTab();
 
-    filteredReviews.sort((a, b) => {
-      switch (sortValue) {
-        case 'date-desc':
-          return new Date(b.date || 0) - new Date(a.date || 0);
-        case 'date-asc':
-          return new Date(a.date || 0) - new Date(b.date || 0);
-        case 'rating-desc':
-          return (b.rating || 0) - (a.rating || 0);
-        case 'rating-asc':
-          return (a.rating || 0) - (b.rating || 0);
-        default:
-          return 0;
-      }
+      filteredReviews.sort((a, b) => {
+        switch (sortValue) {
+          case 'date-desc':
+            return new Date(b.date || 0) - new Date(a.date || 0);
+          case 'date-asc':
+            return new Date(a.date || 0) - new Date(b.date || 0);
+          case 'rating-desc':
+            return (b.rating || 0) - (a.rating || 0);
+          case 'rating-asc':
+            return (a.rating || 0) - (b.rating || 0);
+          default:
+            return 0;
+        }
+      });
+
+      currentPage = 1;
+      renderReviewTable();
     });
-
-    currentPage = 1;
-    renderReviewTable();
   });
 }

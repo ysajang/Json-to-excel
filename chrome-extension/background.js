@@ -1,9 +1,143 @@
 
 
 const collectionsByTab = new Map();
+const debuggerQueuesByTab = new Map();
+// 로컬 디버그 서버(HTTP ingest) 사용 여부: 기본은 끔 (Fetch failed 콘솔 에러 방지)
+const DEBUG_HTTP_INGEST_ENABLED = false;
+
+function enqueueDebuggerTask(tabId, task) {
+  const prev = debuggerQueuesByTab.get(tabId) || Promise.resolve();
+  const next = prev
+    .catch(() => { })
+    .then(task)
+    .catch(() => { })
+    .finally(() => { });
+  debuggerQueuesByTab.set(tabId, next);
+  return next;
+}
+
+function attachDebugger(tabId) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.debugger.attach({ tabId }, '1.3', () => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else resolve(true);
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+function detachDebugger(tabId) {
+  return new Promise((resolve) => {
+    try {
+      chrome.debugger.detach({ tabId }, () => {
+        // lastError를 읽어 "Unchecked runtime.lastError" 콘솔 스팸을 방지
+        const err = chrome.runtime.lastError;
+        resolve(!err);
+      });
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
+function sendDebuggerCommand(tabId, method, params) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else resolve(result);
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
 
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'debug-click' && request.payload) {
+    const tabId = sender?.tab?.id;
+    if (!tabId) {
+      try { sendResponse({ ok: false, error: 'No sender tab id' }); } catch (e) { }
+      return false;
+    }
+
+    const { x, y } = request.payload;
+    console.log(`[리뷰 수집기] debug-click requested: tabId=${tabId}, x=${x}, y=${y}`);
+
+    enqueueDebuggerTask(tabId, async () => {
+      let attached = false;
+      try {
+        await attachDebugger(tabId);
+        attached = true;
+        await sendDebuggerCommand(tabId, 'Page.bringToFront', {});
+        await sendDebuggerCommand(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+        // 실제 클릭 주입
+        await sendDebuggerCommand(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mouseMoved',
+          x,
+          y,
+          button: 'left',
+          buttons: 1,
+          pointerType: 'mouse',
+          modifiers: 0,
+          clickCount: 1
+        });
+        await sendDebuggerCommand(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mousePressed',
+          x,
+          y,
+          button: 'left',
+          buttons: 1,
+          pointerType: 'mouse',
+          modifiers: 0,
+          clickCount: 1
+        });
+        await sendDebuggerCommand(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mouseReleased',
+          x,
+          y,
+          button: 'left',
+          buttons: 0,
+          pointerType: 'mouse',
+          modifiers: 0,
+          clickCount: 1
+        });
+        console.log(`[리뷰 수집기] debug-click ok: tabId=${tabId}`);
+        try { sendResponse({ ok: true }); } catch (e) { }
+      } catch (e) {
+        console.warn(`[리뷰 수집기] debug-click failed: tabId=${tabId}, err=${e?.message || String(e)}`);
+        try { sendResponse({ ok: false, error: e?.message || String(e) }); } catch (e2) { }
+      } finally {
+        // attach 실패한 경우 detach는 오히려 lastError를 더 만들 수 있어 생략
+        if (attached) {
+          await detachDebugger(tabId);
+        }
+      }
+    });
+
+    return true;
+  }
+
+  if (request.action === 'agent-log' && request.payload) {
+    // Fetch failed loading: POST ... 콘솔 에러 방지를 위해 기본은 비활성화
+    if (DEBUG_HTTP_INGEST_ENABLED) {
+      try {
+        fetch('http://127.0.0.1:7242/ingest/3fa54cf1-c4ff-4575-a8dc-81fa9718116d', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request.payload)
+        }).catch(() => { });
+      } catch (e) { }
+    }
+    try { sendResponse({ ok: true }); } catch (e) { }
+    return false;
+  }
 
   if (request.action === 'startCollection') {
     let originalTabId = null;
@@ -19,7 +153,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       });
     }
 
-    if (originalTabId && collectionsByTab.has(originalTabId)) {
+    // 여러 별점 필터링인 경우 각 필터별로 고유한 키 생성
+    const isMultiFilter = request.isMultiFilter === true;
+    let collectionKey = originalTabId;
+    if (isMultiFilter && request.filterIndex !== undefined) {
+      // 여러 필터인 경우 originalTabId + ratingFilter 조합으로 고유 키 생성
+      collectionKey = `${originalTabId}_${request.ratingFilter}_${request.filterIndex}`;
+    }
+
+    if (collectionKey && collectionsByTab.has(collectionKey) && !isMultiFilter) {
       const errorMsg = '이 탭에서 이미 수집 중입니다.';
       try {
         sendResponse({ success: false, error: errorMsg });
@@ -30,16 +172,57 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (!request.tabId) {
       try {
-        sendResponse({ success: true, message: '새 탭 생성 중...' });
+        sendResponse({ success: true, message: '새 창 생성 중...' });
       } catch (e) {
       }
 
-      chrome.tabs.create({
+      chrome.windows.create({
         url: request.url,
-        active: true
-      }).then(newTab => {
+        focused: true,
+        type: 'normal'
+      }).then(newWindow => {
+        // 새 창의 첫 번째 탭 ID 가져오기
+        const newTabId = newWindow.tabs && newWindow.tabs[0] ? newWindow.tabs[0].id : null;
+
+        if (!newTabId) {
+          // 탭 ID를 가져올 수 없으면 재시도
+          setTimeout(() => {
+            chrome.tabs.query({ windowId: newWindow.id }, (tabs) => {
+              if (tabs && tabs[0] && tabs[0].id) {
+                const tabId = tabs[0].id;
+                setTimeout(() => {
+                  // 여러 필터인 경우 배열로 전달, 단일 필터인 경우 문자열로 전달
+                  const ratingFilter = request.ratingFilters && Array.isArray(request.ratingFilters)
+                    ? request.ratingFilters
+                    : (request.ratingFilter || 'all');
+                  startCollection(request.url, tabId, request.productId, ratingFilter, originalTabId, request.isMultiFilter || false, originalTabId)
+                    .catch(error => {
+                      if (originalTabId) {
+                        collectionsByTab.delete(originalTabId);
+                      }
+                      const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
+                      chrome.storage.local.remove(storageKey);
+                    });
+                }, 500);
+              } else {
+                // 탭을 찾을 수 없으면 에러 처리
+                if (originalTabId) {
+                  collectionsByTab.delete(originalTabId);
+                }
+                const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
+                chrome.storage.local.remove(storageKey);
+              }
+            });
+          }, 100);
+          return;
+        }
+
         setTimeout(() => {
-          startCollection(request.url, newTab.id, request.productId, request.ratingFilter || 'all', originalTabId)
+          // 여러 필터인 경우 배열로 전달, 단일 필터인 경우 문자열로 전달
+          const ratingFilter = request.ratingFilters && Array.isArray(request.ratingFilters)
+            ? request.ratingFilters
+            : (request.ratingFilter || 'all');
+          startCollection(request.url, newTabId, request.productId, ratingFilter, originalTabId, request.isMultiFilter || false, originalTabId)
             .catch(error => {
               if (originalTabId) {
                 collectionsByTab.delete(originalTabId);
@@ -59,7 +242,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
-    startCollection(request.url, request.tabId, request.productId, request.ratingFilter || 'all', originalTabId)
+    // 여러 필터인 경우 배열로 전달, 단일 필터인 경우 문자열로 전달
+    const ratingFilter = request.ratingFilters && Array.isArray(request.ratingFilters)
+      ? request.ratingFilters
+      : (request.ratingFilter || 'all');
+    startCollection(request.url, request.tabId, request.productId, ratingFilter, originalTabId, request.isMultiFilter || false, originalTabId)
       .then(() => {
         try {
           sendResponse({ success: true });
@@ -195,6 +382,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } catch (err) {
     }
 
+    // closeTab 플래그가 있으면 수집 탭 닫기
+    if (request.closeTab && collection && collection.collectionTabId) {
+      try {
+        chrome.tabs.remove(collection.collectionTabId).then(() => {
+          // closeTab 플래그로 닫을 때도 원래 탭으로 복귀
+          if (originalTabId) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+              if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
+                chrome.tabs.update(originalTabId, { active: true }).catch(() => { });
+              }
+            });
+          }
+        }).catch((err) => {
+        });
+      } catch (err) {
+      }
+    }
+
     if (collection && collection.collectionTabId) {
       // 알림만 표시하고 바로 탭 닫기 (진행률 표시 없음)
       try {
@@ -215,7 +420,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           if (originalTabId) {
             chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
               if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
-                chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
+                chrome.tabs.update(originalTabId, { active: true }).catch(() => { });
               }
             });
           }
@@ -278,26 +483,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       try {
         chrome.runtime.sendMessage({
           action: 'log',
-          message: '수집 중지. 새 탭을 닫습니다...',
+          message: '수집 중지. 새 창을 닫습니다...',
           type: 'warning'
-        }).catch(() => {});
-      } catch (e) {}
+        }).catch(() => { });
+      } catch (e) { }
 
       setTimeout(() => {
         chrome.tabs.remove(collection.collectionTabId).then(() => {
           try {
             chrome.runtime.sendMessage({
               action: 'log',
-              message: '새 탭이 닫혔습니다.',
+              message: '새 창이 닫혔습니다.',
               type: 'success'
-            }).catch(() => {});
-          } catch (e) {}
+            }).catch(() => { });
+          } catch (e) { }
 
           // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
           if (originalTabId) {
             chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
               if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
-                chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
+                chrome.tabs.update(originalTabId, { active: true }).catch(() => { });
               }
             });
           }
@@ -316,8 +521,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (collection && collection.collectionTabId) {
+      try {
+        chrome.tabs.sendMessage(collection.collectionTabId, request).catch((err) => {
+        });
+      } catch (err) {
+      }
+
       setTimeout(() => {
         chrome.tabs.remove(collection.collectionTabId).then(() => {
+          // 에러 발생 시에도 원래 탭으로 복귀
+          if (originalTabId) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+              if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
+                chrome.tabs.update(originalTabId, { active: true }).catch(() => { });
+              }
+            });
+          }
         }).catch(err => {
         });
       }, 500);
@@ -327,14 +546,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.runtime.sendMessage(request).catch((err) => {
       });
     } catch (err) {
-    }
-
-    if (collection && collection.collectionTabId) {
-      try {
-        chrome.tabs.sendMessage(collection.collectionTabId, request).catch((err) => {
-        });
-      } catch (err) {
-      }
     }
   } else if (request.action === 'getCollectionStatus') {
     const originalTabId = request.originalTabId || null;
@@ -365,8 +576,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 
-async function startCollection(url, tabId, productId, ratingFilter = 'all', originalTabId = null) {
-  if (originalTabId && collectionsByTab.has(originalTabId)) {
+async function startCollection(url, tabId, productId, ratingFilter = 'all', originalTabId = null, isMultiFilter = false, collectionKey = null) {
+  // collectionKey가 제공되지 않으면 originalTabId 사용
+  const key = collectionKey || originalTabId;
+
+  // 여러 별점 필터링인 경우 중복 체크 건너뛰기
+  if (key && collectionsByTab.has(key) && !isMultiFilter) {
     throw new Error('이 탭에서 이미 수집 중입니다.');
   }
 
@@ -380,8 +595,8 @@ async function startCollection(url, tabId, productId, ratingFilter = 'all', orig
     startTime: Date.now()
   };
 
-  if (originalTabId) {
-    collectionsByTab.set(originalTabId, collection);
+  if (key) {
+    collectionsByTab.set(key, collection);
   }
 
   const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
@@ -421,12 +636,20 @@ async function startCollection(url, tabId, productId, ratingFilter = 'all', orig
 
   while (startScrapingRetries > 0 && !startScrapingSuccess) {
     try {
-      const response = await chrome.tabs.sendMessage(tabId, {
+      // ratingFilter가 배열이면 ratingFilters로 전달, 아니면 ratingFilter로 전달
+      const message = {
         action: 'startScraping',
         url,
-        originalTabId: originalTabId,
-        ratingFilter: ratingFilter
-      });
+        originalTabId: originalTabId
+      };
+
+      if (Array.isArray(ratingFilter)) {
+        message.ratingFilters = ratingFilter;
+      } else {
+        message.ratingFilter = ratingFilter;
+      }
+
+      const response = await chrome.tabs.sendMessage(tabId, message);
 
       if (response && response.success) {
         startScrapingSuccess = true;

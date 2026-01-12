@@ -24,32 +24,32 @@
 
       <!-- 별점 필터 섹션 (체크박스) -->
       <div class="section">
-        <label>별점 필터 (여러 개 선택 가능)</label>
-        <div class="rating-filter-group">
-          <label class="rating-checkbox-label">
-            <input type="checkbox" class="rating-checkbox" value="all" id="rating-all" checked>
-            <span>모든 별점</span>
-          </label>
-          <label class="rating-checkbox-label">
-            <input type="checkbox" class="rating-checkbox" value="5" id="rating-5">
-            <span>최고(5)</span>
-          </label>
-          <label class="rating-checkbox-label">
-            <input type="checkbox" class="rating-checkbox" value="4" id="rating-4">
-            <span>좋음(4)</span>
-          </label>
-          <label class="rating-checkbox-label">
-            <input type="checkbox" class="rating-checkbox" value="3" id="rating-3">
-            <span>보통(3)</span>
-          </label>
-          <label class="rating-checkbox-label">
-            <input type="checkbox" class="rating-checkbox" value="2" id="rating-2">
-            <span>별로(2)</span>
-          </label>
-          <label class="rating-checkbox-label">
-            <input type="checkbox" class="rating-checkbox" value="1" id="rating-1">
-            <span>나쁨(1)</span>
-          </label>
+        <label>별점 필터</label>
+        <div class="checkbox-group-container">
+          <div class="checkbox-group">
+            <input type="checkbox" id="ratingAll" name="ratingFilter" value="all" checked>
+            <label for="ratingAll">모든 별점</label>
+          </div>
+          <div class="checkbox-group">
+            <input type="checkbox" id="rating5" name="ratingFilter" value="5">
+            <label for="rating5">최고(5)</label>
+          </div>
+          <div class="checkbox-group">
+            <input type="checkbox" id="rating4" name="ratingFilter" value="4">
+            <label for="rating4">좋음(4)</label>
+          </div>
+          <div class="checkbox-group">
+            <input type="checkbox" id="rating3" name="ratingFilter" value="3">
+            <label for="rating3">보통(3)</label>
+          </div>
+          <div class="checkbox-group">
+            <input type="checkbox" id="rating2" name="ratingFilter" value="2">
+            <label for="rating2">별로(2)</label>
+          </div>
+          <div class="checkbox-group">
+            <input type="checkbox" id="rating1" name="ratingFilter" value="1">
+            <label for="rating1">나쁨(1)</label>
+          </div>
         </div>
       </div>
 
@@ -80,12 +80,24 @@
         <div id="previewTab" class="tab-content active">
           <div class="preview-controls">
             <input type="text" id="searchInput" class="search-input" placeholder="리뷰 내용 검색...">
-            <select id="sortSelect" class="sort-select" title="정렬 기준">
-              <option value="date-desc">날짜 최신순</option>
-              <option value="date-asc">날짜 오래된순</option>
-              <option value="rating-desc">평점 높은순</option>
-              <option value="rating-asc">평점 낮은순</option>
-            </select>
+            <div class="sort-checkbox-container" title="정렬 기준">
+              <div class="sort-checkbox-group">
+                <input type="radio" id="sortDateDesc" name="sortSelect" value="date-desc" checked>
+                <label for="sortDateDesc">날짜 최신순</label>
+              </div>
+              <div class="sort-checkbox-group">
+                <input type="radio" id="sortDateAsc" name="sortSelect" value="date-asc">
+                <label for="sortDateAsc">날짜 오래된순</label>
+              </div>
+              <div class="sort-checkbox-group">
+                <input type="radio" id="sortRatingDesc" name="sortSelect" value="rating-desc">
+                <label for="sortRatingDesc">평점 높은순</label>
+              </div>
+              <div class="sort-checkbox-group">
+                <input type="radio" id="sortRatingAsc" name="sortSelect" value="rating-asc">
+                <label for="sortRatingAsc">평점 낮은순</label>
+              </div>
+            </div>
             <button id="copyTableBtn" class="btn-copy" title="테이블을 클립보드에 복사">📋 복사</button>
           </div>
           <div id="reviewTableContainer" class="review-table-container">

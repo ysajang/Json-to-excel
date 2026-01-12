@@ -17,16 +17,34 @@ let currentCollectedReviews = [];
 let currentRatingFilter = 'all';
 let targetProductId = null;
 let targetUrl = null;
+let currentStage = 'idle';
+// CDP(debug-click)는 환경(다른 확장/보안정책)에 따라 콘솔 에러가 발생할 수 있어 기본은 끔.
+// 필요 시 true로 바꾸면 CDP click을 우선 시도합니다.
+const ENABLE_CDP_CLICK = false;
+// CDP(debug-click) 실패가 반복될 때 콘솔 lastError 스팸 방지를 위해 런타임 중 자동 비활성화
+let cdpClickDisabled = !ENABLE_CDP_CLICK;
 
 // ==================== 상수 정의 ====================
 const CONSTANTS = {
   // 대기 시간 (ms)
   WAIT_TIMES: {
+    // 전체 대기시간 단축(빠른 모드)
     SHORT: 100,
     MEDIUM: 150,
     LONG: 200,
-    PAGE_LOAD: 300,
-    FILTER_APPLY: 150
+    // readyState/DOM 준비 확인용 (짧게)
+    PAGE_LOAD: 500,
+    // window.load 대기(하드 타임아웃)
+    PAGE_LOAD_HARD: 1000,
+    // 리뷰 섹션(#sdpReview) 대기 최대시간
+    REVIEWS_SECTION: 1000,
+    // 페이지 이동 감지 폴링 최대시간
+    PAGE_MOVE_POLL_TIMEOUT: 2000,
+    // 필터 적용 후 추가 대기
+    FILTER_APPLY: 120,
+    // 페이지/블록 이동 후 추가 안정화 대기 (0이면 추가 대기 없음)
+    AFTER_PAGE_NAVIGATION: 0,
+    AFTER_BLOCK_NAVIGATION: 0
   },
   // 최대 재시도 횟수
   MAX_RETRIES: {
@@ -36,7 +54,7 @@ const CONSTANTS = {
   },
   // 페이지네이션
   PAGINATION: {
-    START_BUTTON_INDEX: 2,
+    START_BUTTON_INDEX: 3,
     MAX_BUTTON_INDEX: 12
   },
   // 리뷰 추출 조건
@@ -70,6 +88,52 @@ function sendToUI(message) {
   }
 }
 
+// 전역 안전 전송 헬퍼 (outer scope) - actionLog 등 초기 구간에서 사용
+function safeSendMessage(message, callback) {
+  try {
+    return chrome.runtime.sendMessage(message, callback);
+  } catch (e) {
+    return Promise.resolve(null);
+  }
+}
+
+function actionLog(message, type = 'info') {
+  safeSendMessage({
+    action: 'log',
+    message,
+    type
+  });
+}
+
+// 내부용: 비동기/예외 무시 로그 (goToNextPage 등에서 사용)
+function logToBackground(message, type = 'info') {
+  try {
+    chrome.runtime.sendMessage({ action: 'log', message, type });
+  } catch (e) { }
+}
+
+// 디버그 로그 (NDJSON) - 필요 시 끌 수 있도록 단일 헬퍼로 관리
+function debugLog(message, data = {}, hypothesisId = 'H?') {
+  // #region agent log
+  const payload = {
+    sessionId: 'debug-session',
+    runId: 'pre-fix-3',
+    hypothesisId,
+    location: 'content.js',
+    message,
+    data,
+    timestamp: Date.now()
+  };
+  try {
+    chrome.runtime.sendMessage({ action: 'agent-log', payload }).catch(() => { });
+  } catch (e) { }
+  // #endregion
+}
+
+function setStage(stage, data = {}) {
+  currentStage = stage;
+  debugLog('stage', { stage, ...data }, 'STAGE');
+}
 
 window.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'COUPANG_REVIEW_COLLECTOR_STOP') {
@@ -98,6 +162,31 @@ window.addEventListener('message', (event) => {
       }).catch(() => { });
     } catch (e) { }
   }
+});
+
+// 전역 에러/미처리 예외 로깅
+window.addEventListener('error', (e) => {
+  debugLog('window error', {
+    message: e?.message || (e?.error && e.error.message) || '',
+    filename: e?.filename || '',
+    lineno: e?.lineno || 0,
+    colno: e?.colno || 0,
+    errorName: e?.error && e.error.name,
+    errorMessage: e?.error && e.error.message,
+    errorToString: e?.error ? String(e.error) : '',
+    targetTag: e?.target && e.target.tagName,
+    type: e?.type,
+    stage: currentStage,
+    stack: e?.error && e.error.stack ? String(e.error.stack).substring(0, 800) : ''
+  }, 'ERR');
+}, true);
+
+window.addEventListener('unhandledrejection', (e) => {
+  debugLog('unhandled rejection', {
+    reason: e?.reason ? String(e.reason) : '',
+    stage: currentStage,
+    stack: e?.reason && e.reason.stack ? String(e.reason.stack).substring(0, 800) : ''
+  }, 'ERR');
 });
 
 
@@ -197,12 +286,9 @@ if (!window.__coupangReviewScraperLoaded) {
         }
 
         if (request.action === 'startScraping') {
+          debugLog('startScraping received', { url: request.url, ratingFilter: request.ratingFilter, ratingFilters: request.ratingFilters || [] }, 'H1');
           if (request.originalTabId) {
             currentOriginalTabId = request.originalTabId;
-          }
-
-          if (request.ratingFilter) {
-            currentRatingFilter = request.ratingFilter;
           }
 
           sendToUI({
@@ -229,11 +315,27 @@ if (!window.__coupangReviewScraperLoaded) {
           } catch (e) {
           }
 
-          startScraping(request.url, request.ratingFilter || 'all')
-            .then(result => {
-            })
-            .catch(error => {
-            });
+          // 여러 필터가 있는 경우 순차 처리, 없으면 단일 필터 처리
+          if (request.ratingFilters && Array.isArray(request.ratingFilters) && request.ratingFilters.length > 1) {
+            startMultiFilterScraping(request.url, request.ratingFilters)
+              .then(result => {
+                debugLog('startMultiFilterScraping resolved', { filters: request.ratingFilters, resultSummary: { reviews: result?.reviews?.length, stopped: result?.stopped } }, 'H0');
+              })
+              .catch(error => {
+                debugLog('startMultiFilterScraping rejected', { filters: request.ratingFilters, msg: error?.message || String(error) }, 'ERR');
+              });
+          } else {
+            const ratingFilter = request.ratingFilters && request.ratingFilters.length > 0
+              ? request.ratingFilters[0]
+              : (request.ratingFilter || 'all');
+            startScraping(request.url, ratingFilter)
+              .then(result => {
+                debugLog('startScraping resolved', { rating: ratingFilter, resultSummary: { reviews: result?.reviews?.length, stopped: result?.stopped } }, 'H0');
+              })
+              .catch(error => {
+                debugLog('startScraping rejected', { rating: ratingFilter, msg: error?.message || String(error) }, 'ERR');
+              });
+          }
 
           return true;
         } else if (request.action === 'stopScraping') {
@@ -268,7 +370,192 @@ if (!window.__coupangReviewScraperLoaded) {
       });
     }
 
+    /**
+     * 여러 필터를 순차적으로 처리하는 함수
+     * @param {string} url - 상품 URL
+     * @param {Array<string>} ratingFilters - 별점 필터 배열
+     * @returns {Promise<Object>}
+     */
+    async function startMultiFilterScraping(url, ratingFilters) {
+      const allCollectedReviews = [];
+      const ratingNames = {
+        'all': '모든 별점',
+        '5': '최고(5)',
+        '4': '좋음(4)',
+        '3': '보통(3)',
+        '2': '별로(2)',
+        '1': '나쁨(1)'
+      };
+
+      try {
+        // 페이지 준비 (한 번만)
+        await waitForPageReady();
+        actionLog(`멀티 필터 수집 시작 (${ratingFilters.join(',')})`);
+        const currentUrl = window.location.href;
+        const targetUrl = url.trim();
+        const extractedProductId = targetUrl.match(/\/products\/(\d+)/)?.[1];
+        targetProductId = extractedProductId;
+
+        const currentProductId = currentUrl.match(/\/products\/(\d+)/)?.[1];
+        const targetProductIdFromUrl = targetUrl.match(/\/products\/(\d+)/)?.[1];
+
+        const isProductPage = currentUrl.includes('/vp/products/') || currentUrl.includes('/products/');
+        const productIdMatches = currentProductId && targetProductIdFromUrl && currentProductId === targetProductIdFromUrl;
+
+        if (!isProductPage || !productIdMatches) {
+          safeSendMessage({
+            action: 'log',
+            message: `올바른 상품 페이지로 이동합니다...`,
+            type: 'info'
+          });
+          window.location.href = targetUrl;
+          await waitForPageLoad();
+          await waitForPageReady();
+        }
+
+        await waitForPageReady();
+        debugLog('waitForPageReady done', { step: 'initial' }, 'H1');
+        safeSendMessage({
+          action: 'log',
+          message: '리뷰 탭을 찾고 클릭합니다...',
+          type: 'info'
+        });
+        actionLog('리뷰 탭 클릭 시도');
+        await clickReviewTab();
+        await waitForReviewsSection();
+        await sleep(300);
+
+        // 각 필터별로 순차 처리
+        for (let i = 0; i < ratingFilters.length; i++) {
+          if (stopScraping) {
+            throw new Error('수집이 중지되었습니다.');
+          }
+
+          const ratingFilter = ratingFilters[i];
+          const ratingName = ratingNames[ratingFilter] || ratingFilter;
+
+          safeSendMessage({
+            action: 'log',
+            message: `${ratingName} 필터링 후 리뷰 수집 시작... (${i + 1}/${ratingFilters.length})`,
+            type: 'info'
+          });
+
+          // 필터 적용
+          if (ratingFilter && ratingFilter !== 'all') {
+            safeSendMessage({
+              action: 'log',
+              message: `별점 필터 적용 중: ${ratingFilter}점`,
+              type: 'info'
+            });
+            actionLog(`필터 적용 시도: ${ratingFilter}점`);
+            const filterApplied = await clickRatingFilter(ratingFilter);
+            if (filterApplied) {
+              safeSendMessage({
+                action: 'log',
+                message: `별점 필터 적용 완료: ${ratingFilter}점`,
+                type: 'success'
+              });
+              actionLog(`필터 적용 완료: ${ratingFilter}점`);
+              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+              await waitForPageReady();
+              await waitForReviewsSection();
+              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+            }
+            if (stopScraping) {
+              throw new Error('수집이 중지되었습니다.');
+            }
+          }
+
+          // 리뷰 수집
+          currentRatingFilter = ratingFilter;
+          isScraping = true;
+          currentCollectedReviews = [];
+
+          safeSendMessage({
+            action: 'progress',
+            percent: Math.floor((i / ratingFilters.length) * 100),
+            text: `${ratingName} 필터링 후 리뷰 수집 중... (${i + 1}/${ratingFilters.length})`,
+            originalTabId: currentOriginalTabId
+          });
+
+          const reviews = await collectAllReviews();
+          actionLog(`필터 ${ratingFilter} 수집 완료: ${reviews.length}개`);
+
+          // 수집된 리뷰에 필터 정보 추가
+          const reviewsWithFilter = reviews.map(review => ({
+            ...review,
+            filterRating: ratingFilter
+          }));
+
+          allCollectedReviews.push(...reviewsWithFilter);
+          currentCollectedReviews = allCollectedReviews;
+
+          safeSendMessage({
+            action: 'log',
+            message: `${ratingName} 필터링 후 리뷰 수집 완료: ${reviews.length}개 (누적: ${allCollectedReviews.length}개)`,
+            type: 'success'
+          });
+
+          // 마지막 필터가 아니면 다음 필터로 넘어가기 전 대기
+          if (i < ratingFilters.length - 1) {
+            await sleep(500);
+          }
+        }
+
+        // 모든 필터 수집 완료
+        safeSendMessage({
+          action: 'log',
+          message: `모든 필터 수집 완료: 총 ${allCollectedReviews.length}개 리뷰 수집됨`,
+          type: 'success'
+        });
+        actionLog(`멀티 필터 종료: 총 ${allCollectedReviews.length}개`);
+
+        safeSendMessage({
+          action: 'complete',
+          reviews: allCollectedReviews,
+          stopped: false,
+          originalTabId: currentOriginalTabId,
+          closeTab: true // 페이지 닫기 플래그
+        });
+
+        isScraping = false;
+
+        // 페이지 닫기
+        setTimeout(() => {
+          window.close();
+        }, 1000);
+
+        return { reviews: allCollectedReviews, stopped: false };
+      } catch (error) {
+        isScraping = false;
+        const errorMessage = error instanceof DOMException
+          ? `DOM 오류: ${error.name} - ${error.message || '알 수 없는 DOM 오류'}`
+          : error.message || String(error);
+        debugLog('startScraping error', { msg: errorMessage }, 'H1');
+
+        safeSendMessage({
+          action: 'error',
+          error: errorMessage,
+          originalTabId: currentOriginalTabId
+        });
+
+        // 에러 발생 시에도 수집된 리뷰 전송
+        if (allCollectedReviews.length > 0) {
+          safeSendMessage({
+            action: 'stopped',
+            message: `오류 발생: ${errorMessage} (현재까지 ${allCollectedReviews.length}개 수집됨)`,
+            reviews: allCollectedReviews,
+            originalTabId: currentOriginalTabId
+          });
+        }
+
+        throw new Error(errorMessage);
+      }
+    }
+
     async function startScraping(url, ratingFilter = 'all') {
+      debugLog('startScraping invoked pre-check', { url, ratingFilter, isScraping, stopScraping }, 'H0');
+      setStage('startScraping invoked', { url, ratingFilter, isScraping, stopScraping });
       if (isScraping) {
         throw new Error('이미 수집 중입니다.');
       }
@@ -280,66 +567,122 @@ if (!window.__coupangReviewScraperLoaded) {
       targetUrl = url.trim();
       const extractedProductId = targetUrl.match(/\/products\/(\d+)/)?.[1];
       targetProductId = extractedProductId;
+      const sendMsg = (typeof safeSendMessage === 'function')
+        ? safeSendMessage
+        : (message, callback) => {
+          try {
+            return chrome.runtime.sendMessage(message, callback);
+          } catch (e) {
+            return Promise.resolve(null);
+          }
+        };
 
       try {
+        setStage('startScraping enter', { url: targetUrl, rating: ratingFilter });
         await waitForPageReady();
+        setStage('after waitForPageReady start', { readyState: document.readyState, url: window.location.href });
+        actionLog(`단일 수집 시작 rating=${ratingFilter}`);
+        setStage('after actionLog start', { rating: ratingFilter });
 
-        const currentUrl = window.location.href;
+        try {
+          try {
+            const currentUrl = window.location.href;
 
-        safeSendMessage({
-          action: 'log',
-          message: `현재 URL: ${currentUrl}`,
-          type: 'info'
-        });
-        safeSendMessage({
-          action: 'log',
-          message: `목표 URL: ${targetUrl}`,
-          type: 'info'
-        });
+            sendMsg({
+              action: 'log',
+              message: `현재 URL: ${currentUrl}`,
+              type: 'info'
+            });
+            sendMsg({
+              action: 'log',
+              message: `목표 URL: ${targetUrl}`,
+              type: 'info'
+            });
+            debugLog('url info sent', { currentUrl, targetUrl }, 'H1');
+            let currentProductId = null;
+            let targetProductId = null;
+            try {
+              currentProductId = currentUrl.match(/\/products\/(\d+)/)?.[1];
+            } catch (e) {
+            }
+            try {
+              targetProductId = targetUrl.match(/\/products\/(\d+)/)?.[1];
+            } catch (e) {
+            }
 
-        const currentProductId = currentUrl.match(/\/products\/(\d+)/)?.[1];
-        const targetProductId = targetUrl.match(/\/products\/(\d+)/)?.[1];
+            const isProductPage = currentUrl.includes('/vp/products/') || currentUrl.includes('/products/');
+            const productIdMatches = currentProductId && targetProductId && currentProductId === targetProductId;
 
-        const isProductPage = currentUrl.includes('/vp/products/') || currentUrl.includes('/products/');
-        const productIdMatches = currentProductId && targetProductId && currentProductId === targetProductId;
+            const urlMatches = currentUrl === targetUrl ||
+              currentUrl.replace(/\/$/, '') === targetUrl.replace(/\/$/, '') ||
+              productIdMatches;
+            setStage('url match result', { currentUrl, targetUrl, isProductPage, productIdMatches, urlMatches });
 
-        const urlMatches = currentUrl === targetUrl ||
-          currentUrl.replace(/\/$/, '') === targetUrl.replace(/\/$/, '') ||
-          productIdMatches;
-
-        if (!isProductPage || !productIdMatches) {
-          safeSendMessage({
-            action: 'log',
-            message: `올바른 상품 페이지로 이동합니다... (현재 상품 ID: ${currentProductId || '없음'}, 목표 상품 ID: ${targetProductId || '없음'})`,
-            type: 'info'
-          });
-          window.location.href = targetUrl;
-          await waitForPageLoad();
-          await waitForPageReady();
-        } else {
-          safeSendMessage({
-            action: 'log',
-            message: `이미 올바른 상품 페이지에 있습니다. (상품 ID: ${currentProductId})`,
-            type: 'info'
-          });
+            if (urlMatches && isProductPage) {
+              debugLog('stay on page (url ok)', { currentUrl, targetUrl }, 'H1');
+            } else if (!isProductPage || !productIdMatches) {
+              debugLog('navigate to targetUrl', { currentUrl, targetUrl, isProductPage, productIdMatches }, 'H1');
+              sendMsg({
+                action: 'log',
+                message: `올바른 상품 페이지로 이동합니다... (현재 상품 ID: ${currentProductId || '없음'}, 목표 상품 ID: ${targetProductId || '없음'})`,
+                type: 'info'
+              });
+              window.location.href = targetUrl;
+              await waitForPageLoad();
+              await waitForPageReady();
+              setStage('after navigation wait', { url: window.location.href });
+              debugLog('after navigation wait', { url: window.location.href }, 'H1');
+            } else {
+              debugLog('stay on page (ids match)', { currentProductId, targetProductId }, 'H1');
+              sendMsg({
+                action: 'log',
+                message: `이미 올바른 상품 페이지에 있습니다. (상품 ID: ${currentProductId})`,
+                type: 'info'
+              });
+            }
+          } catch (fatalBlock) {
+            debugLog('fatal in url/product block', {
+              msg: fatalBlock?.message || String(fatalBlock),
+              stack: fatalBlock?.stack ? String(fatalBlock.stack).substring(0, 500) : ''
+            }, 'ERR');
+          }
+        } catch (fatalEarly) {
+          debugLog('fatal before clickReviewTab', {
+            msg: fatalEarly?.message || String(fatalEarly),
+            stack: fatalEarly?.stack ? String(fatalEarly.stack).substring(0, 500) : ''
+          }, 'ERR');
         }
 
         await waitForPageReady();
-        safeSendMessage({
+        setStage('before clickReviewTab', { rating: ratingFilter });
+        debugLog('before clickReviewTab', { rating: ratingFilter }, 'H3');
+        sendMsg({
           action: 'log',
           message: '리뷰 탭을 찾고 클릭합니다...',
           type: 'info'
         });
-        await clickReviewTab();
+        debugLog('clickReviewTab start', { rating: ratingFilter }, 'H3');
+        actionLog('리뷰 탭 클릭 시도');
+        try {
+          await clickReviewTab();
+        } catch (errClick) {
+          debugLog('clickReviewTab error', {
+            msg: errClick?.message || String(errClick),
+            stack: errClick?.stack ? String(errClick.stack).substring(0, 500) : ''
+          }, 'ERR');
+          throw errClick;
+        }
         if (stopScraping) {
           throw new Error('수집이 중지되었습니다.');
         }
-        safeSendMessage({
+        sendMsg({
           action: 'log',
           message: '리뷰 탭 클릭 완료',
           type: 'success'
         });
+        debugLog('clickReviewTab done', { rating: ratingFilter }, 'H3');
         await waitForReviewsSection();
+        debugLog('after waitForReviewsSection', { rating: ratingFilter }, 'H3');
         if (stopScraping) {
           throw new Error('수집이 중지되었습니다.');
         }
@@ -349,72 +692,83 @@ if (!window.__coupangReviewScraperLoaded) {
         }
 
         if (ratingFilter && ratingFilter !== 'all') {
-          console.log(`[리뷰 수집기] 별점 필터 적용 중: ${ratingFilter}점`);
-          safeSendMessage({
+          sendMsg({
             action: 'log',
             message: `별점 필터 적용 중: ${ratingFilter}점`,
             type: 'info'
           });
-          const filterApplied = await clickRatingFilter(ratingFilter);
-          if (filterApplied) {
-            console.log(`[리뷰 수집기] 별점 필터 적용 완료: ${ratingFilter}점 - 필터링된 리뷰만 수집합니다.`);
-            safeSendMessage({
-              action: 'log',
-              message: `별점 필터 적용 완료: ${ratingFilter}점 - 필터링된 리뷰만 수집합니다.`,
-              type: 'success'
-            });
-            // 필터 적용 후 페이지 업데이트 대기
-            await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
-            await waitForPageReady();
-            await waitForReviewsSection();
-            await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
-          } else {
-            console.warn(`[리뷰 수집기] 별점 필터를 찾을 수 없습니다. 모든 리뷰를 수집합니다.`);
-            safeSendMessage({
-              action: 'log',
-              message: '별점 필터를 찾을 수 없습니다. 모든 리뷰를 수집합니다.',
-              type: 'warning'
-            });
+          actionLog(`필터 적용 시도: ${ratingFilter}점`);
+          debugLog('filter apply start', { rating: ratingFilter }, 'H4');
+          try {
+            const filterApplied = await clickRatingFilter(ratingFilter);
+            if (filterApplied) {
+              sendMsg({
+                action: 'log',
+                message: `별점 필터 적용 완료: ${ratingFilter}점 - 필터링된 리뷰만 수집합니다.`,
+                type: 'success'
+              });
+              actionLog(`필터 적용 완료: ${ratingFilter}점`);
+              debugLog('filter apply done', { rating: ratingFilter }, 'H4');
+              // 필터 적용 후 페이지 업데이트 대기
+              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+              await waitForPageReady();
+              await waitForReviewsSection();
+              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+            } else {
+              sendMsg({
+                action: 'log',
+                message: '별점 필터를 찾을 수 없습니다. 모든 리뷰를 수집합니다.',
+                type: 'warning'
+              });
+            }
+          } catch (errFilter) {
+            debugLog('filter apply error', {
+              msg: errFilter?.message || String(errFilter),
+              stack: errFilter?.stack ? String(errFilter.stack).substring(0, 500) : ''
+            }, 'ERR');
+            throw errFilter;
           }
           if (stopScraping) {
             throw new Error('수집이 중지되었습니다.');
           }
-        } else {
-          console.log(`[리뷰 수집기] 별점 필터 없음 - 모든 별점의 리뷰를 수집합니다.`);
         }
+        debugLog('filter branch completed', { rating: ratingFilter }, 'H4');
 
-        safeSendMessage({
+        sendMsg({
           action: 'log',
           message: '리뷰 수집을 시작합니다...',
           type: 'info'
         });
-        safeSendMessage({
+        sendMsg({
           action: 'progress',
           percent: 5,
           text: '리뷰 수집 준비 중...',
           originalTabId: currentOriginalTabId
         });
+        debugLog('collectAllReviews call', { rating: ratingFilter }, 'H2');
         const allReviews = await collectAllReviews();
+        debugLog('collectAllReviews done', { rating: ratingFilter, count: allReviews.length }, 'H2');
+        actionLog(`단일 필터 종료: 총 ${allReviews.length}개`);
         currentCollectedReviews = allReviews;
-        safeSendMessage({
+        sendMsg({
           action: 'log',
           message: `리뷰 수집 완료: 총 ${allReviews.length}개 리뷰 수집됨`,
           type: 'success'
         });
         if (allReviews.length === 0) {
           const errorMsg = '리뷰를 찾을 수 없습니다. 리뷰 추출을 종료합니다.';
-          safeSendMessage({
+          sendMsg({
             action: 'log',
             message: '리뷰를 찾지 못했습니다.',
             type: 'warning'
           });
-          safeSendMessage({
+          sendMsg({
             action: 'log',
             message: '리뷰 추출을 종료합니다.',
             type: 'warning'
           });
 
-          safeSendMessage({
+          sendMsg({
             action: 'stopped',
             message: errorMsg,
             reviews: [],
@@ -431,14 +785,14 @@ if (!window.__coupangReviewScraperLoaded) {
         currentCollectedReviews = allReviews;
 
         if (isStopped) {
-          safeSendMessage({
+          sendMsg({
             action: 'stopped',
             message: `수집이 중지되었습니다. (현재까지 ${allReviews.length}개 수집됨)`,
             reviews: allReviews,
             originalTabId: currentOriginalTabId
           });
         } else {
-          safeSendMessage({
+          sendMsg({
             action: 'complete',
             reviews: allReviews,
             stopped: false,
@@ -454,7 +808,7 @@ if (!window.__coupangReviewScraperLoaded) {
           ? `DOM 오류: ${error.name} - ${error.message || '알 수 없는 DOM 오류'}`
           : error.message || String(error);
 
-        safeSendMessage({
+        sendMsg({
           action: 'error',
           error: errorMessage,
           originalTabId: currentOriginalTabId
@@ -462,6 +816,10 @@ if (!window.__coupangReviewScraperLoaded) {
         }).catch(err => {
         });
         throw new Error(errorMessage);
+      } finally {
+        setStage('startScraping finally', { isScraping, stopScraping });
+        isScraping = false;
+        stopScraping = false;
       }
     }
 
@@ -484,11 +842,11 @@ if (!window.__coupangReviewScraperLoaded) {
           };
           window.addEventListener('load', handler, { once: true });
 
-          // 타임아웃 설정 (10초)
+          // 타임아웃 설정 (상수: PAGE_LOAD_HARD)
           setTimeout(() => {
             window.removeEventListener('load', handler);
             resolve();
-          }, 10000);
+          }, CONSTANTS.WAIT_TIMES.PAGE_LOAD_HARD);
         }
       });
     }
@@ -556,7 +914,7 @@ if (!window.__coupangReviewScraperLoaded) {
         }
 
         let observer = null;
-        const maxWaitTime = 5000;
+        const maxWaitTime = CONSTANTS.WAIT_TIMES.REVIEWS_SECTION;
         const checkInterval = 50;
         const startTime = Date.now();
 
@@ -694,6 +1052,66 @@ if (!window.__coupangReviewScraperLoaded) {
       });
     }
 
+    function findRatingFilterDropdown() {
+      const filterSelector = '#sdpReview > div > div > div.xl\\:twc-flex.xl\\:twc-gap-\\[24px\\] > div.twc-relative.xl\\:twc-flex-\\[1_1_0\\].xl\\:twc-overflow-hidden > div.twc-flex.max-md\\:twc-flex-wrap.twc-items-center.twc-gap-y-\\[12px\\] > div.twc-flex.twc-items-center.twc-justify-between.twc-gap-\\[8px\\].twc-w-full.twc-h-\\[40px\\].twc-px-\\[14px\\].twc-border.twc-border-bluegray-300.twc-rounded-\\[4px\\].twc-bg-white.twc-cursor-pointer.desktop-hover\\:twc-bg-bluegray-800\\/20.active\\:twc-bg-bluegray-800\\/30.focus\\:twc-outline-none.twc-flex-\\[0_0_142px\\].twc-ml-\\[8px\\]';
+
+      let filterDropdown = safeQuerySelector(filterSelector);
+
+      if (!filterDropdown) {
+        const alternativeSelectors = [
+          '#sdpReview div[class*="cursor-pointer"][class*="border-bluegray-300"]',
+          '#sdpReview div[class*="flex"][class*="items-center"][class*="border"]',
+          '#sdpReview select',
+          '#sdpReview button[class*="filter"]'
+        ];
+
+        for (const selector of alternativeSelectors) {
+          const candidate = safeQuerySelector(selector);
+          if (candidate && candidate.offsetParent !== null) {
+            filterDropdown = candidate;
+            break;
+          }
+        }
+      }
+
+      return filterDropdown;
+    }
+
+    function detectCurrentRatingFilterValue() {
+      const dropdown = findRatingFilterDropdown();
+      if (!dropdown) return null;
+
+      const labelText = (safeGetText(dropdown) || '').replace(/\s+/g, ' ').trim();
+      if (!labelText) return null;
+
+      const detectionMap = {
+        'all': ['모든', '전체'],
+        '5': ['5점', '5 ', '최고', '★★★★★', '별 5'],
+        '4': ['4점', '4 ', '좋음', '★★★★☆', '별 4'],
+        '3': ['3점', '3 ', '보통', '★★★☆☆', '별 3'],
+        '2': ['2점', '2 ', '별로', '★★☆☆☆', '별 2'],
+        '1': ['1점', '1 ', '나쁨', '★☆☆☆☆', '별 1']
+      };
+
+      for (const [rating, terms] of Object.entries(detectionMap)) {
+        for (const term of terms) {
+          if (labelText.includes(term)) {
+            return rating;
+          }
+        }
+      }
+
+      return null;
+    }
+
+    async function ensureRatingFilterApplied(ratingValue) {
+      if (!ratingValue || ratingValue === 'all') return true;
+      const active = detectCurrentRatingFilterValue();
+      if (active === ratingValue) return true;
+      const applied = await clickRatingFilter(ratingValue);
+      return applied;
+    }
+
     async function clickRatingFilter(ratingValue) {
       return new Promise(async (resolve) => {
         if (stopScraping) {
@@ -713,33 +1131,7 @@ if (!window.__coupangReviewScraperLoaded) {
             return;
           }
 
-          const filterSelector = '#sdpReview > div > div > div.xl\\:twc-flex.xl\\:twc-gap-\\[24px\\] > div.twc-relative.xl\\:twc-flex-\\[1_1_0\\].xl\\:twc-overflow-hidden > div.twc-flex.max-md\\:twc-flex-wrap.twc-items-center.twc-gap-y-\\[12px\\] > div.twc-flex.twc-items-center.twc-justify-between.twc-gap-\\[8px\\].twc-w-full.twc-h-\\[40px\\].twc-px-\\[14px\\].twc-border.twc-border-bluegray-300.twc-rounded-\\[4px\\].twc-bg-white.twc-cursor-pointer.desktop-hover\\:twc-bg-bluegray-800\\/20.active\\:twc-bg-bluegray-800\\/30.focus\\:twc-outline-none.twc-flex-\\[0_0_142px\\].twc-ml-\\[8px\\]';
-
-          let filterDropdown = null;
-          try {
-            filterDropdown = document.querySelector(filterSelector);
-          } catch (e) {
-          }
-
-          if (!filterDropdown) {
-            const alternativeSelectors = [
-              '#sdpReview div[class*="cursor-pointer"][class*="border-bluegray-300"]',
-              '#sdpReview div[class*="flex"][class*="items-center"][class*="border"]',
-              '#sdpReview select',
-              '#sdpReview button[class*="filter"]'
-            ];
-
-            for (const selector of alternativeSelectors) {
-              try {
-                filterDropdown = document.querySelector(selector);
-                if (filterDropdown && filterDropdown.offsetParent !== null) {
-                  break;
-                }
-              } catch (e) {
-                continue;
-              }
-            }
-          }
+          let filterDropdown = findRatingFilterDropdown();
 
           if (!filterDropdown || filterDropdown.offsetParent === null) {
             resolve(false);
@@ -747,6 +1139,7 @@ if (!window.__coupangReviewScraperLoaded) {
           }
 
           try {
+            actionLog('필터 드롭다운 클릭');
             if (!safeClick(filterDropdown)) {
               resolve(false);
               return;
@@ -948,13 +1341,30 @@ if (!window.__coupangReviewScraperLoaded) {
 
     async function collectAllReviews() {
       const allReviews = [];
+      debugLog('collectAllReviews start', { rating: currentRatingFilter }, 'H2');
       currentCollectedReviews = allReviews;
-      let currentPage = 1;
-      let consecutiveFailures = 0;
-      const maxFailures = CONSTANTS.MAX_RETRIES.CONSECUTIVE_FAILURES;
+      let logicalPage = 1; // 논리적 페이지(우리가 추적), DOM 페이지와 분리
       let hasNoReviewsMessage = false;
-      let buttonIndex = CONSTANTS.PAGINATION.START_BUTTON_INDEX;
-      const maxButtonIndex = CONSTANTS.PAGINATION.MAX_BUTTON_INDEX;
+      const visitedPageSignatures = new Set(); // 중복 페이지 방지 (article 요소 기반 + rating)
+      const buildPageSignatureFromExtracted = (reviews, fallbackDomSig) => {
+        try {
+          const pageNum = getCurrentPageNumber();
+          const top = Array.isArray(reviews) ? reviews.slice(0, 3) : [];
+          const parts = top.map(r => {
+            const rid = (r.reviewId || r.id || '').toString().substring(0, 40);
+            const au = (r.author || '').toString().substring(0, 20);
+            const dt = (r.date || '').toString().substring(0, 20);
+            const rt = (r.rating || '').toString();
+            const ct = (r.content || '').toString().substring(0, 60);
+            return `${rid}|${au}|${dt}|${rt}|${ct}`;
+          });
+          const count = Array.isArray(reviews) ? reviews.length : 0;
+          const dom = (fallbackDomSig || '').substring(0, 120);
+          return `p=${pageNum || 'na'};c=${count};${parts.join('||')};dom=${dom}`;
+        } catch (e) {
+          return fallbackDomSig || '';
+        }
+      };
 
       const updateCurrentCollectedReviews = () => {
         currentCollectedReviews = [...allReviews];
@@ -999,9 +1409,6 @@ if (!window.__coupangReviewScraperLoaded) {
         }
       }
 
-      // 첫 페이지 리뷰 수집 플래그
-      let firstPageCollected = false;
-
       if (firstPageReviews.length > 0) {
         safeSendMessage({
           action: 'progress',
@@ -1014,315 +1421,359 @@ if (!window.__coupangReviewScraperLoaded) {
           if (!isDuplicate) {
             allReviews.push(review);
             updateCurrentCollectedReviews();
-
-            const reviewContent = review.content || '';
-            const reviewDate = review.date || '날짜 없음';
-            const reviewRating = parseInt(review.rating) || 0;
-            const contentPreview = reviewContent.length > 50 ? reviewContent.substring(0, 50) + '...' : reviewContent;
-            console.log(`[리뷰 수집기] 수집됨 #${allReviews.length}: ${reviewRating}점 - ${contentPreview}`);
-
-            // 진행률 업데이트 (첫 페이지 리뷰 수집 시마다)
-            const reviewProgressPercent = Math.min(20, 15 + Math.floor((allReviews.length / Math.max(firstPageReviews.length, 1)) * 5));
-            safeSendMessage({
-              action: 'progress',
-              percent: reviewProgressPercent,
-              text: `첫 페이지: ${allReviews.length}/${firstPageReviews.length}개 수집 중...`,
-              originalTabId: currentOriginalTabId
-            });
-
-            safeSendMessage({
-              action: 'log',
-              message: `수집됨 #${allReviews.length}: ${reviewRating}점 - ${contentPreview}`,
-              type: 'info'
-            });
-            safeSendMessage({
-              action: 'log',
-              message: `리뷰 수집 #${allReviews.length}: [${reviewDate}] ${'★'.repeat(reviewRating)}${'☆'.repeat(5 - reviewRating)} (${reviewRating}점) - ${contentPreview}`,
-              type: 'info'
-            });
           } else {
-            // 중복 리뷰는 로그만 출력 (디버깅용)
-            const reviewContent = review.content || '';
-            const reviewRating = parseInt(review.rating) || 0;
-            const contentPreview = reviewContent.length > 50 ? reviewContent.substring(0, 50) + '...' : reviewContent;
-            safeSendMessage({
-              action: 'log',
-              message: `중복 리뷰 건너뜀: ${reviewRating}점 - ${contentPreview}`,
-              type: 'info'
-            });
+            // 사용자 요청: 리뷰 단위 로그는 제외 (중복 리뷰도 조용히 스킵)
           }
         }
-        // 첫 페이지 리뷰 수집 완료
-        firstPageCollected = true;
-        // 첫 페이지 리뷰 수집 완료 후 다음 페이지로 이동
-        // 필터링 후에는 이미 필터링된 첫 페이지 리뷰를 수집했으므로 2페이지부터 시작
-        currentPage = 1;
+        // 다음 이동은 2페이지부터 시작
+        logicalPage = 2;
 
         // 첫 페이지 수집 후 즉시 다음 페이지로 이동 (중복 추출 방지)
-        if (buttonIndex <= maxButtonIndex) {
-          const hasNext = await goToNextPage(buttonIndex);
-          if (hasNext) {
-            buttonIndex++;
-            await sleep(CONSTANTS.WAIT_TIMES.SHORT);
-          } else {
-            // 다음 페이지가 없으면 종료
-            updateCurrentCollectedReviews();
-            safeSendMessage({
-              action: 'progress',
-              percent: 95,
-              text: `수집 완료: 총 ${allReviews.length}개 리뷰`,
-              originalTabId: currentOriginalTabId
-            });
-            return allReviews;
-          }
+        // 첫 페이지의 article 요소 시그니처를 rating 포함 형식으로 저장
+        const firstDomSig = getFirstReviewSignatureFromDom();
+        if (firstPageReviews.length > 0 && firstDomSig) {
+          visitedPageSignatures.add(`${currentRatingFilter}|${firstDomSig}`);
         }
+
       } else {
         // 첫 페이지에 리뷰가 없으면 1페이지부터 시작 (페이지 이동 후 리뷰 확인)
-        currentPage = 1;
+        logicalPage = 1;
       }
 
 
-      while (!stopScraping && !hasNoReviewsMessage && consecutiveFailures < maxFailures) {
-        if (stopScraping) {
-          updateCurrentCollectedReviews();
+      // 핵심 흐름: (페이지 이동) -> (필터 확인/재적용) -> (리뷰 추출)
+      // 첫 페이지는 위에서 이미 처리했으므로 여기서는 logicalPage=2부터 "이동 후 추출"만 수행
+      let currentBlockIndex = 0; // 1~10: 0블록, 11~20: 1블록 ...
+
+      while (!stopScraping && !hasNoReviewsMessage) {
+        if (stopScraping) break;
+
+        const targetPage = logicalPage;
+        // 1) 목표 페이지로 이동 (먼저 이동!)
+        const desiredBlockIndex = Math.floor((targetPage - 1) / 10);
+        const posInBlock = ((targetPage - 1) % 10) + 1; // 1..10
+        const buttonIndexForPage = posInBlock + 1; // page1->2, page2->3 ... page10->11
+
+        const prevSig = getFirstReviewSignatureFromDom();
+        const paginationBefore = getPaginationInfo();
+        const prevPageNum = paginationBefore.activePage;
+        // DOM 기준 현재 블록(1~10, 11~20, 21~30...)을 매 루프 동기화
+        // currentBlockIndex가 실제보다 앞서가면(예: 2로 고정) 21페이지 진입 시 next(12)를 안 눌러서
+        // button:nth-child(2)=11을 클릭하게 되고, 결국 11~20이 반복되는 루프가 발생한다.
+        if (paginationBefore.blockStart !== null) {
+          currentBlockIndex = Math.floor((paginationBefore.blockStart - 1) / 10);
+        } else if (prevPageNum !== null) {
+          currentBlockIndex = Math.floor((prevPageNum - 1) / 10);
+        }
+
+        // 블록 전환이 필요하면(11,21,...) next(12) 먼저 클릭
+        if (desiredBlockIndex > currentBlockIndex) {
           safeSendMessage({
             action: 'log',
-            message: `중지 요청 감지: 수집을 중지합니다. (현재까지 ${allReviews.length}개 수집됨)`,
+            message: `페이지 ${targetPage} 진입 전 블록 전환: currentBlock=${currentBlockIndex} -> desiredBlock=${desiredBlockIndex} (buttonIndex=12)`,
+            type: 'info'
+          });
+          // next(12)를 눌렀다고 가정하지 말고, "블록 시작 숫자"가 바뀌었는지 확인한다.
+          const desiredBlockStart = (desiredBlockIndex * 10) + 1;
+          const beforeBlockStart = paginationBefore.blockStart;
+          let blockMoved = false;
+          for (let attempt = 0; attempt < 3 && !blockMoved; attempt++) {
+            const movedBlock = await goToNextPage(12);
+            if (!movedBlock) break;
+            await waitForPageReady();
+            await waitForReviewsSection();
+            await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+            // 블록 전환 후 추가 대기 (전체 단축: 기본 0ms)
+            await sleep(CONSTANTS.WAIT_TIMES.AFTER_BLOCK_NAVIGATION);
+            const afterInfo = getPaginationInfo();
+            const afterBlockStart = afterInfo.blockStart;
+            // 목표 블록 시작(21,31,41...)이 보이면 성공으로 간주
+            if (afterBlockStart !== null && afterBlockStart >= desiredBlockStart) {
+              blockMoved = true;
+              currentBlockIndex = Math.floor((afterBlockStart - 1) / 10);
+              break;
+            }
+            // 변화가 없으면 조금 더 기다렸다가 재시도
+            await sleep(CONSTANTS.WAIT_TIMES.LONG);
+            // beforeBlockStart가 null인 경우에는 단순 재시도
+            if (beforeBlockStart !== null && afterBlockStart !== null && afterBlockStart !== beforeBlockStart) {
+              // 일단 변화는 있었는데 목표 블록이 아니면(여러 번 클릭됨) 현재 값으로 동기화
+              currentBlockIndex = Math.floor((afterBlockStart - 1) / 10);
+            }
+          }
+
+          if (!blockMoved) {
+            safeSendMessage({
+              action: 'log',
+              message: `다음 블록(>) 버튼이 없거나 블록 전환이 불가능하여 마지막 페이지로 판단하고 종료합니다. (targetPage=${targetPage})`,
+              type: 'warning'
+            });
+            break;
+          }
+          await waitForReviewsSection();
+        }
+
+        safeSendMessage({
+          action: 'log',
+          message: `페이지 이동: targetPage=${targetPage}, button:nth-child(${buttonIndexForPage}), prevPage=${prevPageNum}, prevSig=${(prevSig || '').substring(0, 80)}`,
+          type: 'info'
+        });
+
+        // 페이지 이동 시도 (최대 2회 재시도)
+        let clicked = false;
+        for (let retry = 0; retry < 2 && !clicked; retry++) {
+          clicked = await goToPageNumber(targetPage, buttonIndexForPage);
+          if (!clicked && retry < 1) {
+            safeSendMessage({
+              action: 'log',
+              message: `페이지 버튼 클릭 실패. 재시도 중... (targetPage=${targetPage}, 시도 ${retry + 1}/2)`,
+              type: 'warning'
+            });
+            await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+          }
+        }
+
+        if (!clicked) {
+          safeSendMessage({
+            action: 'log',
+            message: `페이지 버튼을 찾지 못했습니다. (targetPage=${targetPage}, buttonIndex=${buttonIndexForPage}) 수집 종료`,
             type: 'warning'
           });
           break;
         }
 
-        // 첫 페이지는 이미 수집했으므로 건너뛰고 다음 페이지로 이동
-        // (while 루프 진입 전에 이미 다음 페이지로 이동했으므로 이 조건은 거의 실행되지 않음)
-        if (currentPage === 1 && firstPageCollected) {
+        await waitForPageReady();
+        await waitForReviewsSection();
+        await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+        // 페이지간 이동 후 추가 안정화 대기 (전체 단축: 기본 0ms)
+        await sleep(CONSTANTS.WAIT_TIMES.AFTER_PAGE_NAVIGATION);
+
+        let afterSig = getFirstReviewSignatureFromDom();
+        let afterPageNum = getCurrentPageNumber();
+        let moved =
+          // 1) 페이지 번호가 목표값으로 맞춰졌으면 이동 성공
+          (afterPageNum !== null && afterPageNum === targetPage) ||
+          // 2) 페이지 번호가 바뀌었으면 이동 성공
+          (afterPageNum !== null && prevPageNum !== null && afterPageNum !== prevPageNum) ||
+          // 3) 페이지 번호를 못 읽는 경우 대비: 리뷰 카드 시그니처가 바뀌면 이동 성공
+          (afterSig && prevSig && afterSig !== prevSig);
+
+        // 이동 감지 실패 시: 즉시 종료하지 말고, 로딩 지연을 감안해 최대 5초까지 재확인(추가 클릭 없음)
+        let movementUnconfirmed = false;
+        if (!moved) {
+          const start = Date.now();
+          const timeoutMs = CONSTANTS.WAIT_TIMES.PAGE_MOVE_POLL_TIMEOUT;
+          const pollMs = 200;
+          while (!stopScraping && !moved && (Date.now() - start) < timeoutMs) {
+            await sleep(pollMs);
+            await waitForReviewsSection();
+            afterSig = getFirstReviewSignatureFromDom();
+            afterPageNum = getCurrentPageNumber();
+            moved =
+              (afterPageNum !== null && afterPageNum === targetPage) ||
+              (afterPageNum !== null && prevPageNum !== null && afterPageNum !== prevPageNum) ||
+              (afterSig && prevSig && afterSig !== prevSig);
+          }
+        }
+
+        if (!moved) {
+          movementUnconfirmed = true;
           safeSendMessage({
             action: 'log',
-            message: `첫 페이지는 이미 수집했으므로 다음 페이지로 이동합니다.`,
-            type: 'info'
+            message: `페이지 이동 확인 불가: targetPage=${targetPage}, prevPage=${prevPageNum}, afterPage=${afterPageNum}, prevSig=${(prevSig || '').substring(0, 40)}, afterSig=${(afterSig || '').substring(0, 40)} → 추출로 확인`,
+            type: 'warning'
           });
-          // 다음 페이지로 이동
-          if (buttonIndex > maxButtonIndex) {
-            break;
-          }
-          const hasNext = await goToNextPage(buttonIndex);
-          if (hasNext) {
-            buttonIndex++;
-            currentPage = 2;
-            await sleep(CONSTANTS.WAIT_TIMES.SHORT);
-            continue;
-          } else {
-            break;
-          }
         }
 
-        safeSendMessage({
-          action: 'log',
-          message: `페이지 ${currentPage} 리뷰 수집 시작...`,
-          type: 'info'
-        });
-
-        const baseProgress = 15 + Math.min(75, (currentPage - 1) * 5);
-        safeSendMessage({
-          action: 'progress',
-          percent: baseProgress,
-          text: `페이지 ${currentPage} 리뷰 추출 중...`,
-          originalTabId: currentOriginalTabId
-        });
-
-        const reviews = await extractReviewsFromPage();
-        if (stopScraping) {
-          updateCurrentCollectedReviews();
-          break;
+        // DOM 페이지 번호는 오탐/지연이 잦아 logicalPage를 동기화하면 "홀수만 수집" 같은 스킵이 발생할 수 있음.
+        // 따라서 logicalPage는 "목표 페이지(targetPage)" 흐름을 그대로 유지하고, dom 값은 참고 로그만 남긴다.
+        if (afterPageNum !== null && afterPageNum !== targetPage) {
+          safeSendMessage({
+            action: 'log',
+            message: `페이지 번호 불일치(참고): target=${targetPage}, dom=${afterPageNum} (logical 유지)`,
+            type: 'warning'
+          });
         }
 
-        if (reviews.length === 0) {
-          const sdpReview = document.querySelector('#sdpReview');
-          if (sdpReview) {
-            const reviewElements = sdpReview.querySelectorAll('article, div[class*="review"], div[class*="comment"]');
-            if (reviewElements.length === 0) {
-              const reviewText = sdpReview.textContent || '';
-              const hasNoReviewInSection = noReviewMessages.some(msg => {
-                const regex = new RegExp(msg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-                return regex.test(reviewText);
-              });
+        // 2) 필터 확인/재적용 (이동 후!)
+        if (currentRatingFilter && currentRatingFilter !== 'all') {
+          // 페이지 이동 후 필터 드롭다운이 렌더링될 때까지 대기
+          await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
 
-              if (hasNoReviewInSection) {
-                hasNoReviewsMessage = true;
-                break;
-              }
+          // 필터 감지 재시도 로직 (최대 3회)
+          let activeFilter = null;
+          let retryCount = 0;
+          const maxRetries = 3;
+
+          while (retryCount < maxRetries && !activeFilter) {
+            activeFilter = detectCurrentRatingFilterValue();
+            if (!activeFilter && retryCount < maxRetries - 1) {
+              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+              retryCount++;
             } else {
+              break;
             }
           }
 
-          consecutiveFailures++;
-          if (consecutiveFailures >= maxFailures) {
+          // 필터가 해제되었거나 감지되지 않은 경우 재적용
+          if (activeFilter !== currentRatingFilter) {
             safeSendMessage({
               action: 'log',
-              message: '리뷰를 찾지 못했습니다.',
-              type: 'warning'
+              message: `필터 상태 확인: 현재='${activeFilter || '감지 실패'}', 목표='${currentRatingFilter}' → 재적용`,
+              type: 'info'
             });
-            safeSendMessage({
-              action: 'log',
-              message: '리뷰 추출을 종료합니다.',
-              type: 'warning'
-            });
-            break;
-          }
 
-          await sleep(CONSTANTS.WAIT_TIMES.SHORT);
-          if (stopScraping) {
-            updateCurrentCollectedReviews();
-            break;
+            const applied = await ensureRatingFilterApplied(currentRatingFilter);
+            if (applied) {
+              // 필터 재적용 후 검증
+              await waitForPageReady();
+              await waitForReviewsSection();
+              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+
+              // 재적용 후 필터 상태 재확인
+              const verifiedFilter = detectCurrentRatingFilterValue();
+              if (verifiedFilter === currentRatingFilter) {
+                safeSendMessage({
+                  action: 'log',
+                  message: `필터 재적용 완료: '${currentRatingFilter}' 확인됨`,
+                  type: 'info'
+                });
+              } else {
+                safeSendMessage({
+                  action: 'log',
+                  message: `필터 재적용 후 검증 실패: 현재='${verifiedFilter || '감지 실패'}', 목표='${currentRatingFilter}' (계속 진행)`,
+                  type: 'warning'
+                });
+              }
+            }
           }
-          continue;
         }
 
-        // 다음 페이지 존재 여부를 먼저 확인 (마지막 페이지 판단용)
-        let isLastPage = false;
-        if (buttonIndex > maxButtonIndex) {
-          isLastPage = true;
-        } else {
-          const hasNext = await goToNextPage(buttonIndex, true); // 확인만 하고 이동하지 않음
-          if (!hasNext) {
-            isLastPage = true;
-          }
-        }
+        // 3) 리뷰 추출
+        safeSendMessage({
+          action: 'log',
+          message: `페이지 ${logicalPage} 리뷰 추출 시작 (sig=${(afterSig || '').substring(0, 80)})`,
+          type: 'info'
+        });
 
-        // 마지막 페이지인 경우 마지막 리뷰 제외
-        if (isLastPage && reviews.length > 0) {
-          reviews.pop();
+        const reviews = await extractReviewsFromPage();
+        if (stopScraping) break;
+
+        // 페이지 단위 중복 방지(이동 실패/렌더 반복 시 안전장치)
+        // "이동 직후 DOM 1개"로 만든 afterSig는 렌더 지연/고정 리뷰로 중복 오판이 나서,
+        // 실제 추출 결과(상위 N개 + 개수 + 페이지번호)로 시그니처를 다시 만든다.
+        const finalSig = buildPageSignatureFromExtracted(reviews, afterSig);
+        const pageSigKey = `${currentRatingFilter}|${finalSig || ''}`;
+        if (finalSig && visitedPageSignatures.has(pageSigKey)) {
           safeSendMessage({
             action: 'log',
-            message: `마지막 페이지의 마지막 리뷰를 제외합니다.`,
+            message: `동일 페이지 반복 감지: ${pageSigKey.substring(0, 120)} (수집 종료 로직 비활성화됨 - 계속 진행)`,
+            type: 'warning'
+          });
+          // 사용자 요청: 동일 페이지 반복 시 수집 종료(break) 로직 주석 처리
+          // break;
+        }
+        if (finalSig) visitedPageSignatures.add(pageSigKey);
+
+        // 이동은 되었는데 리뷰가 0개면 다음 페이지 이동을 시도해보고, 실패하면 종료
+        if (!reviews || reviews.length === 0) {
+          safeSendMessage({
+            action: 'log',
+            message: `리뷰가 0개입니다. (페이지 ${logicalPage}) 다음 페이지 이동 시도 중...`,
+            type: 'warning'
+          });
+
+          // 다음 페이지로 이동 시도
+          const nextPage = logicalPage + 1;
+          const nextButtonIndex = nextPage <= 10 ? nextPage + 2 : 12; // 1~10페이지는 직접 버튼, 11+는 블록 이동
+
+          // 다음 페이지 이동 시도 (최대 2회)
+          let nextPageMoved = false;
+          for (let retry = 0; retry < 2 && !nextPageMoved; retry++) {
+            await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+            const nextClicked = await goToPageNumber(nextPage, nextButtonIndex);
+            if (nextClicked) {
+              await waitForPageReady();
+              await waitForReviewsSection();
+              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+
+              // 다음 페이지에서 리뷰가 있는지 확인
+              const nextPageReviews = await extractReviewsFromPage();
+              if (nextPageReviews && nextPageReviews.length > 0) {
+                nextPageMoved = true;
+                safeSendMessage({
+                  action: 'log',
+                  message: `다음 페이지(${nextPage})에서 리뷰 ${nextPageReviews.length}개 발견. 계속 수집합니다.`,
+                  type: 'info'
+                });
+                // 다음 페이지 리뷰를 수집
+                for (const review of nextPageReviews) {
+                  if (stopScraping) break;
+                  const isDuplicate = isDuplicateReview(review, allReviews);
+                  if (!isDuplicate) {
+                    allReviews.push(review);
+                    updateCurrentCollectedReviews();
+                  }
+                }
+                logicalPage = nextPage;
+                continue; // while 루프 계속
+              }
+            }
+          }
+
+          // 다음 페이지 이동 실패 또는 다음 페이지에도 리뷰가 없으면 종료
+          if (!nextPageMoved) {
+            safeSendMessage({
+              action: 'log',
+              message: `더 이상 리뷰가 없습니다. (페이지 ${logicalPage}) 수집 종료`,
+              type: 'info'
+            });
+            break;
+          }
+        }
+
+        // 이동 확인이 안 됐는데도 추출 결과가 나왔다면(로딩 지연 케이스), 이후부터는 정상 흐름으로 계속 진행
+        if (movementUnconfirmed) {
+          safeSendMessage({
+            action: 'log',
+            message: `페이지 이동은 미확인 상태였지만 리뷰 추출 성공: ${reviews.length}개 (페이지 ${logicalPage})`,
             type: 'info'
           });
         }
 
         // 리뷰 수집
+        let addedCount = 0;
+        let duplicateCount = 0;
         for (const review of reviews) {
-          if (stopScraping) {
-            break;
-          }
-
+          if (stopScraping) break;
           const isDuplicate = isDuplicateReview(review, allReviews);
           if (!isDuplicate) {
             allReviews.push(review);
             updateCurrentCollectedReviews();
-
-            const reviewContent = review.content || '';
-            const reviewDate = review.date || '날짜 없음';
-            const reviewRating = parseInt(review.rating) || 0;
-            const contentPreview = reviewContent.length > 50 ? reviewContent.substring(0, 50) + '...' : reviewContent;
-            console.log(`[리뷰 수집기] 수집됨 #${allReviews.length}: ${reviewRating}점 - ${contentPreview}`);
-
-            // 진행률 업데이트 (리뷰 수집 시마다)
-            const reviewProgressPercent = Math.min(90, 15 + Math.floor((allReviews.length / Math.max(allReviews.length + 10, 1)) * 75));
-            safeSendMessage({
-              action: 'progress',
-              percent: reviewProgressPercent,
-              text: `${allReviews.length}개 리뷰 수집 중...`,
-              originalTabId: currentOriginalTabId
-            });
-
-            safeSendMessage({
-              action: 'log',
-              message: `수집됨 #${allReviews.length}: ${reviewRating}점 - ${contentPreview}`,
-              type: 'info'
-            });
-            safeSendMessage({
-              action: 'log',
-              message: `리뷰 수집 #${allReviews.length}: [${reviewDate}] ${'★'.repeat(reviewRating)}${'☆'.repeat(5 - reviewRating)} (${reviewRating}점) - ${contentPreview}`,
-              type: 'info'
-            });
+            addedCount++;
           } else {
-            // 중복 리뷰는 로그만 출력 (디버깅용)
-            const reviewContent = review.content || '';
-            const reviewRating = parseInt(review.rating) || 0;
-            const contentPreview = reviewContent.length > 50 ? reviewContent.substring(0, 50) + '...' : reviewContent;
-            safeSendMessage({
-              action: 'log',
-              message: `중복 리뷰 건너뜀: ${reviewRating}점 - ${contentPreview}`,
-              type: 'info'
-            });
+            duplicateCount++;
           }
         }
 
-        if (stopScraping) {
-          updateCurrentCollectedReviews();
-          break;
+        // 수집 통계 로그
+        if (duplicateCount > 0) {
+          safeSendMessage({
+            action: 'log',
+            message: `페이지 ${logicalPage}: ${addedCount}개 추가, ${duplicateCount}개 중복 제외`,
+            type: 'info'
+          });
         }
 
-        const progressPercent = Math.min(90, 15 + (currentPage * 5));
-        const progressText = `${allReviews.length}개 리뷰 수집 중... (페이지 ${currentPage})`;
         safeSendMessage({
           action: 'progress',
-          percent: progressPercent,
-          text: progressText,
-          log: `페이지 ${currentPage}: ${reviews.length}개 리뷰 발견, 총 ${allReviews.length}개 수집됨`,
-          logType: 'info',
+          percent: Math.min(90, 15 + (logicalPage * 5)),
+          text: `${allReviews.length}개 리뷰 수집 중... (페이지 ${logicalPage})`,
           originalTabId: currentOriginalTabId
-        }).then(() => {
-        }).catch(err => {
         });
 
-        if (stopScraping) {
-          break;
-        }
-
-        // button:nth-child 인덱스가 최대값을 초과하면 중지
-        if (buttonIndex > maxButtonIndex) {
-          safeSendMessage({
-            action: 'log',
-            message: `최대 페이지 수(${maxButtonIndex})에 도달했습니다.`,
-            type: 'info'
-          });
-          break;
-        }
-
-        safeSendMessage({
-          action: 'log',
-          message: `다음 페이지로 이동 시도... (button:nth-child(${buttonIndex}))`,
-          type: 'info'
-        });
-        const hasNext = await goToNextPage(buttonIndex);
-
-        if (stopScraping) {
-          updateCurrentCollectedReviews();
-          break;
-        }
-
-        const currentUrlAfterPageMove = window.location.href;
-        const currentProductIdAfter = currentUrlAfterPageMove.match(/\/products\/(\d+)/)?.[1];
-
-        if (targetProductId && currentProductIdAfter !== targetProductId) {
-          safeSendMessage({
-            action: 'log',
-            message: `오류: 다른 상품 페이지로 이동했습니다. 수집을 중지합니다.`,
-            type: 'error'
-          });
-          break;
-        }
-
-        if (!hasNext) {
-          safeSendMessage({
-            action: 'log',
-            message: `button:nth-child(${buttonIndex})를 찾을 수 없습니다. 더 이상 수집할 페이지가 없습니다.`,
-            type: 'info'
-          });
-          break;
-        } else {
-          safeSendMessage({
-            action: 'log',
-            message: `페이지 ${currentPage + 1}로 이동 완료 (button:nth-child(${buttonIndex}))`,
-            type: 'success'
-          });
-        }
-
-        currentPage++;
-        buttonIndex++; // 다음 button:nth-child 인덱스로 증가
-        consecutiveFailures = 0;
-        await sleep(100);
+        logicalPage += 1; // 다음 페이지로
+        await sleep(CONSTANTS.WAIT_TIMES.SHORT);
       }
 
       updateCurrentCollectedReviews();
@@ -1436,27 +1887,50 @@ if (!window.__coupangReviewScraperLoaded) {
         let bestSelector = '';
         let allFoundElements = new Set();
 
-        // 모든 셀렉터를 시도하고 모든 요소를 수집 (중복 제거, 최적화)
-        for (const selector of reviewSelectors) {
-          if (stopScraping) break;
-
+        // article 요소를 우선적으로 찾기 (최우선)
+        if (sdpReview) {
           try {
-            const elements = safeQuerySelectorAll(selector);
-            if (elements.length > 0) {
-              // 모든 요소를 Set에 추가 (중복 제거)
-              elements.forEach(el => {
+            const articleElements = safeQuerySelectorAll('article', sdpReview);
+            if (articleElements.length > 0) {
+              articleElements.forEach(el => {
                 if (el && el.nodeType === Node.ELEMENT_NODE) {
                   allFoundElements.add(el);
                 }
               });
-
-              if (elements.length > maxFoundCount) {
-                maxFoundCount = elements.length;
-                bestSelector = selector;
+              if (articleElements.length > maxFoundCount) {
+                maxFoundCount = articleElements.length;
+                bestSelector = 'article (우선 검색)';
               }
             }
           } catch (e) {
-            continue;
+            // article 요소를 찾지 못한 경우 계속 진행
+          }
+        }
+
+        // article 요소를 찾지 못한 경우에만 다른 셀렉터 시도
+        if (allFoundElements.size === 0) {
+          // 모든 셀렉터를 시도하고 모든 요소를 수집 (중복 제거, 최적화)
+          for (const selector of reviewSelectors) {
+            if (stopScraping) break;
+
+            try {
+              const elements = safeQuerySelectorAll(selector);
+              if (elements.length > 0) {
+                // 모든 요소를 Set에 추가 (중복 제거)
+                elements.forEach(el => {
+                  if (el && el.nodeType === Node.ELEMENT_NODE) {
+                    allFoundElements.add(el);
+                  }
+                });
+
+                if (elements.length > maxFoundCount) {
+                  maxFoundCount = elements.length;
+                  bestSelector = selector;
+                }
+              }
+            } catch (e) {
+              continue;
+            }
           }
         }
 
@@ -1563,6 +2037,27 @@ if (!window.__coupangReviewScraperLoaded) {
             // 에러 발생 시 빈 배열 반환
           }
         }
+
+        // 히스토그램/요약 카드 제거 (data-review-id 없는 요소 중 별점 분포 텍스트)
+        const histogramPattern = /(최고\s*\d+%.*좋음\s*\d+%.*보통\s*\d+%.*별로\s*\d+%.*나쁨\s*\d+%)/;
+        reviewElements = reviewElements.filter((el) => {
+          if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+          const hasReviewId =
+            el.hasAttribute('data-review-id') ||
+            el.hasAttribute('data-reviewid') ||
+            !!safeQuerySelector('[data-review-id],[data-reviewid]', el);
+          if (hasReviewId) return true;
+          const text = safeGetText(el).replace(/\s+/g, ' ');
+          if (histogramPattern.test(text)) {
+            safeSendMessage({
+              action: 'log',
+              message: '요약/히스토그램 요소를 건너뜁니다.',
+              type: 'info'
+            });
+            return false;
+          }
+          return true;
+        });
         for (let i = 0; i < reviewElements.length; i++) {
           if (stopScraping) {
             break;
@@ -1583,11 +2078,12 @@ if (!window.__coupangReviewScraperLoaded) {
               continue;
             }
 
-            // 필터링 조건 (상수 사용)
-            if (elementText.length < CONSTANTS.REVIEW.MIN_CONTENT_LENGTH ||
-              elementText.length > CONSTANTS.REVIEW.MAX_CONTENT_LENGTH) {
+            // 필터링 조건 (상수 사용) - 최소 길이 조건 완화 (0자 이상 허용)
+            // elementText가 너무 짧거나 길면 스킵하되, 최소 길이를 0으로 완화하여 더 많은 리뷰 수집
+            if (elementText.length > CONSTANTS.REVIEW.MAX_CONTENT_LENGTH) {
               continue;
             }
+            // MIN_CONTENT_LENGTH 체크는 제거하여 짧은 리뷰도 수집 가능하도록 함
 
             if (stopScraping) break;
 
@@ -1609,20 +2105,8 @@ if (!window.__coupangReviewScraperLoaded) {
                   review.content = review.content || '';
                 }
                 reviews.push(review);
-
-                // 디버깅: 각 리뷰 추출 로그
-                safeSendMessage({
-                  action: 'log',
-                  message: `리뷰 추출 #${reviews.length}: 작성자=${review.author || '없음'}, 내용=${(review.content || review.title || '').substring(0, 30)}...`,
-                  type: 'info'
-                });
               } else {
-                // 추출 실패한 리뷰 로그
-                safeSendMessage({
-                  action: 'log',
-                  message: `리뷰 추출 실패: 작성자=${review.author || '없음'}, 내용길이=${(review.content || '').length}, 날짜=${review.date || '없음'}, 별점=${review.rating || '없음'}`,
-                  type: 'warning'
-                });
+                // 사용자 요청: 리뷰 단위 로그는 제외 (추출 실패도 조용히 스킵)
               }
             }
           } catch (error) {
@@ -1730,8 +2214,14 @@ if (!window.__coupangReviewScraperLoaded) {
               const authorEl = safeQuerySelector(authorSelector, element);
               if (authorEl) {
                 const authorText = safeGetText(authorEl);
-                // 작성자 이름 패턴 확인 (한글 + * 포함)
-                if (authorText && (authorText.includes('*') || /^[가-힣]/.test(authorText) || authorText === '쿠팡실구매자')) {
+                // 작성자 이름 패턴 확인 (한글, 영어, * 포함)
+                // 영어 이름도 허용: 영문자로 시작하거나, * 포함, 또는 한글로 시작
+                if (authorText && (
+                  authorText.includes('*') ||
+                  /^[가-힣]/.test(authorText) ||
+                  /^[A-Za-z]/.test(authorText) ||
+                  authorText === '쿠팡실구매자'
+                )) {
                   author = authorText;
                   break;
                 }
@@ -1973,7 +2463,9 @@ if (!window.__coupangReviewScraperLoaded) {
       }
 
       // 필터링된 경우 필터 값으로 평점 설정, 그렇지 않으면 추출한 평점 사용
-      const finalRating = (currentRatingFilter && currentRatingFilter !== 'all') ? currentRatingFilter : (rating || '');
+      const parsedRating = (rating && `${rating}`.trim()) || '';
+      const activeFilterValue = detectCurrentRatingFilterValue();
+      const finalRating = parsedRating || ((activeFilterValue === currentRatingFilter && currentRatingFilter !== 'all') ? currentRatingFilter : '');
 
       // 제목만 있고 내용이 없을 경우 내용을 제목과 동일하게 하지 않음
       // (내용은 그대로 빈 문자열로 유지)
@@ -2085,189 +2577,473 @@ if (!window.__coupangReviewScraperLoaded) {
       });
 
       if (duplicateIndex !== -1) {
-        // 중복 발견 시 기존 리뷰 제거하고 true 반환 (중복임을 표시)
-        existingReviews.splice(duplicateIndex, 1);
+        // 중복 발견: 기존 리뷰는 유지하고 중복 여부만 반환
         return true; // 중복임을 표시
       }
 
       return false; // 중복 아님
     }
 
-    async function goToNextPage(buttonIndex, checkOnly = false) {
-      return new Promise(async (resolve) => {
-        const currentUrlBeforeClick = window.location.href;
-        const currentProductIdBefore = currentUrlBeforeClick.match(/\/products\/(\d+)/)?.[1];
+    // 다음 페이지로 이동하는 함수 (버튼 인덱스, checkOnly 모드 지원)
+    async function goToPageNumber(targetPage, fallbackButtonIndex = null, checkOnly = false) {
+      logToBackground(`goToPageNumber 진입: targetPage=${targetPage}, fallbackButtonIndex=${fallbackButtonIndex}, checkOnly=${checkOnly}`, 'info');
 
-        if (targetProductId && currentProductIdBefore !== targetProductId) {
-          safeSendMessage({
-            action: 'log',
-            message: `경고: 현재 페이지가 목표 상품과 다릅니다. (현재: ${currentProductIdBefore}, 목표: ${targetProductId})`,
-            type: 'warning'
+      try {
+        const targetText = String(targetPage);
+        const candidates = [
+          '#sdpReview div[data-page]',
+          '#sdpReview nav',
+          '#sdpReview div.twc-overflow-hidden div:nth-child(5) > div',
+          '#sdpReview div.twc-overflow-hidden',
+          '#sdpReview'
+        ];
+
+        let container = null;
+        for (const sel of candidates) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          // 해당 컨테이너 안에 목표 숫자 버튼이 하나라도 있으면 우선 채택
+          const hasTarget = Array.from(el.querySelectorAll('button, a, div[role="button"]')).some(btn => {
+            const t = (btn.textContent || '').trim();
+            return t === targetText;
           });
-          if (targetUrl) {
-            safeSendMessage({
-              action: 'log',
-              message: `목표 상품 페이지로 복구합니다...`,
-              type: 'warning'
-            });
-            window.location.href = targetUrl;
-            await waitForPageLoad();
-            await waitForPageReady();
-            resolve(false);
-            return;
+          if (hasTarget) {
+            container = el;
+            break;
           }
         }
+        // 그래도 못 찾으면 getPaginationInfo의 컨테이너를 사용
+        if (!container) {
+          const pageInfo = getPaginationInfo();
+          container = pageInfo.container || document.querySelector('#sdpReview');
+        }
 
-        // 특정 셀렉터의 button:nth-child 사용
-        const baseSelector = '#sdpReview > div > div > div.xl\\:twc-flex.xl\\:twc-gap-\\[24px\\] > div.twc-relative.xl\\:twc-flex-\\[1_1_0\\].xl\\:twc-overflow-hidden > div:nth-child(6) > div > button';
-        const selector = `${baseSelector}:nth-child(${buttonIndex})`;
+        if (!container) {
+          logToBackground(`goToPageNumber 실패: 페이지네이션 컨테이너를 찾지 못했습니다. (targetPage=${targetPage})`, 'warning');
+          if (fallbackButtonIndex !== null) return await goToNextPage(fallbackButtonIndex, checkOnly);
+          return false;
+        }
 
-        let nextButton = null;
+        const buttons = Array.from(container.querySelectorAll('button, a, div[role="button"]'))
+          .filter(btn => ((btn.textContent || '').trim() === targetText));
+
+        if (!buttons.length) {
+          logToBackground(`goToPageNumber 실패: targetPage=${targetPage} 버튼을 찾지 못했습니다.`, 'warning');
+          if (fallbackButtonIndex !== null) return await goToNextPage(fallbackButtonIndex, checkOnly);
+          return false;
+        }
+
+        // 이미 활성화된 페이지면 클릭 없이 성공 처리
+        const isActive = (btn) =>
+          btn?.classList?.contains('twc-font-bold') ||
+          btn?.getAttribute?.('aria-current') === 'page' ||
+          btn?.getAttribute?.('aria-current') === 'true';
+
+        if (buttons.some(isActive)) {
+          logToBackground(`goToPageNumber noop: 이미 ${targetPage}페이지(활성)`, 'info');
+          return true;
+        }
+
+        if (checkOnly) {
+          logToBackground(`goToPageNumber checkOnly: targetPage=${targetPage} 버튼 존재`, 'info');
+          return true;
+        }
+
+        // 클릭 대상: 활성/비활성/비가시 여부 등을 고려해 첫 번째 후보 사용
+        const btn = buttons[0];
         try {
-          nextButton = document.querySelector(selector);
-          if (nextButton && nextButton.offsetParent !== null && !nextButton.disabled) {
-            safeSendMessage({
-              action: 'log',
-              message: `페이지네이션 버튼 발견: button:nth-child(${buttonIndex})`,
-              type: 'info'
-            });
-          } else {
-            nextButton = null;
-          }
+          btn.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' });
+        } catch (e) { }
+
+        // 클릭 시도 (DOMException 대비)
+        try {
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
         } catch (e) {
-          nextButton = null;
+          try { btn.click(); } catch (e2) { }
         }
 
-        // 특정 셀렉터로 찾지 못한 경우 기존 방식으로 fallback
-        if (!nextButton) {
-          const sdpReview = safeQuerySelector('#sdpReview');
-          if (!sdpReview) {
-            resolve(false);
-            return;
+        logToBackground(`goToPageNumber 완료: targetPage=${targetPage}`, 'info');
+        return true;
+      } catch (e) {
+        logToBackground(`goToPageNumber 최상위 예외: ${e?.message || String(e)}`, 'warning');
+        if (fallbackButtonIndex !== null) return await goToNextPage(fallbackButtonIndex, checkOnly);
+        return false;
+      }
+    }
+
+    async function goToNextPage(buttonIndex, checkOnly = false) {
+      logToBackground(`goToNextPage 진입: buttonIndex=${buttonIndex}, checkOnly=${checkOnly}`, 'info');
+
+      // 이미 목표 페이지(라벨)인 경우에는 다시 클릭하지 않음 (재시도 루프에서 페이지가 밀리는 현상 방지)
+      try {
+        if (!checkOnly && buttonIndex >= 2 && buttonIndex <= 11) {
+          const pageInfo = getPaginationInfo();
+          const expectedLabel =
+            pageInfo.blockStart !== null
+              ? (pageInfo.blockStart + (buttonIndex - 2))
+              : (buttonIndex - 1); // 폴백(초기 블록 가정)
+          const cur = getCurrentPageNumber();
+          if (cur !== null && cur === expectedLabel) {
+            logToBackground(`goToNextPage noop: 이미 ${cur}페이지 (buttonIndex=${buttonIndex})`, 'info');
+            return true;
+          }
+        }
+      } catch (e) { }
+      // 내부 헬퍼: 버튼 탐색 (여러 셀렉터 + 텍스트/아이콘 매칭)
+      const selectPaginationButton = () => {
+        const strictSelector = `#sdpReview > div > div > div.xl\\:twc-flex.xl\\:twc-gap-\\[24px\\] > div.twc-relative.xl\\:twc-flex-\\[1_1_0\\].xl\\:twc-overflow-hidden > div:nth-child(5) > div > button:nth-child(${buttonIndex}), #sdpReview > div > div > div.xl\\:twc-flex.xl\\:twc-gap-\\[24px\\] > div.twc-relative.xl\\:twc-flex-\\[1_1_0\\].xl\\:twc-overflow-hidden > div:nth-child(5) > div > a:nth-child(${buttonIndex})`;
+        // prev/next 화살표가 1칸을 차지하는 경우 대비한 +1 오프셋 셀렉터
+        const strictSelectorPlusOne = `#sdpReview > div > div > div.xl\\:twc-flex.xl\\:twc-gap-\\[24px\\] > div.twc-relative.xl\\:twc-flex-\\[1_1_0\\].xl\\:twc-overflow-hidden > div:nth-child(5) > div > button:nth-child(${buttonIndex + 1}), #sdpReview > div > div > div.xl\\:twc-flex.xl\\:twc-gap-\\[24px\\] > div.twc-relative.xl\\:twc-flex-\\[1_1_0\\].xl\\:twc-overflow-hidden > div:nth-child(5) > div > a:nth-child(${buttonIndex + 1})`;
+        const relaxedSelectors = [
+          `#sdpReview div[data-page] > button:nth-child(${buttonIndex})`,
+          `#sdpReview div[data-page] > a:nth-child(${buttonIndex})`,
+          `#sdpReview div.twc-overflow-hidden div:nth-child(5) > div > button:nth-child(${buttonIndex})`,
+          `#sdpReview div.twc-overflow-hidden div:nth-child(5) > div > a:nth-child(${buttonIndex})`,
+          `#sdpReview div.twc-overflow-hidden button:nth-child(${buttonIndex})`,
+          `#sdpReview div.twc-overflow-hidden a:nth-child(${buttonIndex})`
+        ];
+        const relaxedSelectorsPlusOne = [
+          `#sdpReview div[data-page] > button:nth-child(${buttonIndex + 1})`,
+          `#sdpReview div[data-page] > a:nth-child(${buttonIndex + 1})`,
+          `#sdpReview div.twc-overflow-hidden div:nth-child(5) > div > button:nth-child(${buttonIndex + 1})`,
+          `#sdpReview div.twc-overflow-hidden div:nth-child(5) > div > a:nth-child(${buttonIndex + 1})`,
+          `#sdpReview div.twc-overflow-hidden button:nth-child(${buttonIndex + 1})`,
+          `#sdpReview div.twc-overflow-hidden a:nth-child(${buttonIndex + 1})`
+        ];
+
+        const findByLabelOrIcon = () => {
+          const pageInfo = getPaginationInfo();
+          const container =
+            pageInfo.container ||
+            document.querySelector('#sdpReview div[data-page]') ||
+            document.querySelector('#sdpReview div.twc-overflow-hidden div:nth-child(5) > div') ||
+            document.querySelector('#sdpReview div.twc-overflow-hidden') ||
+            document.querySelector('#sdpReview');
+          const buttons = container ? Array.from(container.querySelectorAll('button, a, div[role="button"]')) : [];
+
+          // 숫자 페이지 버튼은 현재 블록 시작 숫자 기준으로 찾는다.
+          if (buttonIndex >= 2 && buttonIndex <= 11 && pageInfo.blockStart !== null) {
+            const expectedAbsLabel = pageInfo.blockStart + (buttonIndex - 2);
+            for (const btn of buttons) {
+              const text = (btn.textContent || '').trim();
+              if (text === String(expectedAbsLabel)) {
+                const isActive =
+                  btn.classList?.contains('twc-font-bold') ||
+                  btn.getAttribute('aria-current') === 'page' ||
+                  btn.getAttribute('aria-current') === 'true';
+                if (!isActive) return btn;
+              }
+            }
           }
 
-          const paginationButtons = safeQuerySelectorAll(
-            'button, [class*="pagination"] button',
-            sdpReview
+          // next(12) 화살표 버튼
+          if (buttonIndex === 12) {
+            for (const btn of buttons) {
+              const arrow = btn.querySelector && btn.querySelector('svg');
+              // Tailwind arbitrary value class(예: twc-rotate-[180deg])는 CSS selector에서 [] 이스케이프가 필요함
+              const isPrevArrow = btn.querySelector && btn.querySelector('svg.twc-rotate-\\[180deg\\]');
+              if (arrow && !isPrevArrow) return btn;
+            }
+          }
+
+          // 폴백: 기존 nth-child 셀렉터로 처리
+          return null;
+        };
+
+        // 라벨/아이콘 매칭을 우선적으로 선택하고, 이후 셀렉터 후보를 순차적으로 사용
+        const candidatesRaw = [
+          findByLabelOrIcon(),
+          document.querySelector(strictSelector),
+          ...relaxedSelectors.map(sel => document.querySelector(sel)),
+          document.querySelector(strictSelectorPlusOne),
+          ...relaxedSelectorsPlusOne.map(sel => document.querySelector(sel))
+        ];
+        const candidates = candidatesRaw.filter((btn) => {
+          if (!btn) return false;
+          // 활성화된 페이지 버튼(굵은/파란색)과 이전 화살표 제외
+          // Tailwind arbitrary value class(예: twc-rotate-[180deg])는 CSS selector에서 [] 이스케이프가 필요함
+          const isPrevArrow = btn.querySelector && btn.querySelector('svg.twc-rotate-\\[180deg\\]');
+          const isActive =
+            btn.classList?.contains('twc-font-bold') ||
+            btn.getAttribute('aria-current') === 'page' ||
+            btn.getAttribute('aria-current') === 'true';
+          return !isPrevArrow && !isActive;
+        });
+
+        return candidates[0] || null;
+      };
+
+      // 짧게 재시도하여 렌더 지연 대응
+      const tryFindWithRetry = async (retries = 3) => {
+        for (let i = 0; i <= retries; i++) {
+          const btn = selectPaginationButton();
+          if (btn) return btn;
+          await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+        }
+        return null;
+      };
+
+      return (async () => {
+        try {
+          logToBackground(`goToNextPage 단계: tryFindWithRetry 시작 (buttonIndex=${buttonIndex})`, 'info');
+          const btn = await tryFindWithRetry(buttonIndex === 12 ? 8 : 3);
+          if (!btn) {
+            logToBackground(`goToNextPage 실패: 버튼 찾기 실패 (buttonIndex=${buttonIndex})`, 'warning');
+            return false;
+          }
+          logToBackground(
+            `goToNextPage 단계: 버튼 찾음 tag=${btn?.tagName || 'unknown'}, text='${(btn?.textContent || '').trim()}', class='${btn?.className || ''}'`,
+            'info'
           );
-
-          for (const button of paginationButtons) {
-            const text = button.textContent?.trim() || '';
-            const ariaLabel = button.getAttribute('aria-label') || '';
-            const buttonParent = button.closest('#sdpReview');
-
-            if (!buttonParent) {
-              continue;
-            }
-
-            if (text === '다음' || ariaLabel.includes('다음')) {
-              if (!button.disabled && button.offsetParent !== null) {
-                const href = button.getAttribute('href');
-                if (href && !href.includes('/products/')) {
-                  nextButton = button;
-                  break;
-                } else if (!href) {
-                  nextButton = button;
-                  break;
-                }
-              }
-            }
-          }
-
-          if (!nextButton) {
-            const currentPage = getCurrentPageNumber();
-            const nextPageNum = currentPage + 1;
-
-            for (const button of paginationButtons) {
-              const text = button.textContent?.trim() || '';
-              const buttonParent = button.closest('#sdpReview');
-              if (!buttonParent) {
-                continue;
-              }
-              if (text === String(nextPageNum) && !button.disabled) {
-                const href = button.getAttribute('href');
-                if (href && !href.includes('/products/')) {
-                  nextButton = button;
-                  break;
-                } else if (!href) {
-                  nextButton = button;
-                  break;
-                }
-              }
-            }
-          }
-        }
-
-        if (nextButton) {
-          if (checkOnly) {
-            // 확인만 하고 클릭하지 않음
-            resolve(true);
-            return;
-          }
-
+          let style = null;
           try {
-            nextButton.click();
-            await sleep(CONSTANTS.WAIT_TIMES.SHORT);
-            await waitForPageLoad();
-            await waitForPageReady();
-            await waitForReviewsSection();
-            await sleep(CONSTANTS.WAIT_TIMES.SHORT);
+            style = getComputedStyle(btn);
+          } catch (e) {
+          }
+          const visible = style ? (style.visibility !== 'hidden' && style.display !== 'none' && btn.offsetParent !== null) : true;
+          if (btn.disabled || !visible) {
+            logToBackground(`goToNextPage 실패: 버튼 비활성/비가시 (buttonIndex=${buttonIndex})`, 'warning');
+            return false;
+          }
+          try {
+            btn.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+          } catch (e) {
+          }
+          if (!checkOnly) {
+            // 쿠팡은 합성 클릭을 무시할 수 있어 background의 chrome.debugger로 "진짜 클릭"을 주입
+            try {
+              if (cdpClickDisabled) {
+                logToBackground(`debug-click 비활성화 상태: fallback click만 수행 (buttonIndex=${buttonIndex})`, 'warning');
+                try { btn.click(); } catch (e) { }
+              } else {
+                const hasRectFn = typeof btn?.getBoundingClientRect === 'function';
+                if (!hasRectFn) {
+                  logToBackground(`debug-click 좌표 계산 불가: getBoundingClientRect 없음 (tag=${btn?.tagName})`, 'warning');
+                  try { btn.click(); } catch (e) { }
+                } else {
+                  const rect = btn.getBoundingClientRect();
+                  const x = Math.floor(rect.left + rect.width / 2);
+                  const y = Math.floor(rect.top + rect.height / 2);
 
-            const currentUrlAfterClick = window.location.href;
-            const currentProductIdAfter = currentUrlAfterClick.match(/\/products\/(\d+)/)?.[1];
+                  // debug-click 요청/응답을 반드시 로그로 남김 (원인 분기용)
+                  logToBackground(
+                    `debug-click 요청: idx=${buttonIndex}, text='${(btn.textContent || '').trim()}', x=${x}, y=${y}, rect=(${Math.floor(rect.left)},${Math.floor(rect.top)},${Math.floor(rect.width)},${Math.floor(rect.height)})`,
+                    'info'
+                  );
 
-            if (targetProductId && currentProductIdAfter !== targetProductId) {
-              safeSendMessage({
-                action: 'log',
-                message: `오류: 다른 상품 페이지로 이동했습니다. (현재: ${currentProductIdAfter}, 목표: ${targetProductId})`,
-                type: 'error'
-              });
-              if (targetUrl) {
-                safeSendMessage({
-                  action: 'log',
-                  message: `목표 상품 페이지로 복구합니다...`,
-                  type: 'warning'
-                });
-                window.location.href = targetUrl;
-                await waitForPageLoad();
-                await waitForPageReady();
-                resolve(false);
-                return;
+                  const resp = await safeSendMessage({ action: 'debug-click', payload: { x, y } });
+                  if (!resp || resp.ok !== true) {
+                    logToBackground(
+                      `debug-click 실패/미응답: ok=${resp?.ok}, error=${resp?.error || 'none'} (fallback click)`,
+                      'warning'
+                    );
+                    // 특정 에러(확장프로그램 URL 접근 불가)가 반복되면 CDP 클릭을 런타임 중 끔
+                    const errMsg = String(resp?.error || '');
+                    if (errMsg.includes('chrome-extension://') || errMsg.includes('Cannot access')) {
+                      cdpClickDisabled = true;
+                      logToBackground(`debug-click 자동 비활성화: error='${errMsg}'`, 'warning');
+                    }
+                    // 폴백: 일반 클릭 시도
+                    try { btn.click(); } catch (e) { }
+                  } else {
+                    logToBackground(`debug-click 성공: x=${x}, y=${y}`, 'info');
+                  }
+                }
+              }
+            } catch (e) {
+              logToBackground(`debug-click 처리 중 예외: ${e?.message || e}`, 'warning');
+              const msg = String(e?.message || e || '');
+              if (msg.includes('chrome-extension://') || msg.includes('Cannot access')) {
+                cdpClickDisabled = true;
+                logToBackground(`debug-click 자동 비활성화(예외): error='${msg}'`, 'warning');
+              }
+              try { btn.click(); } catch (e2) { }
+            }
+          }
+          logToBackground(`goToNextPage 완료: buttonIndex=${buttonIndex}, checkOnly=${checkOnly}`, 'info');
+          return true;
+        } catch (error) {
+          logToBackground(`goToNextPage 최상위 예외: ${error?.message || String(error)}`, 'warning');
+          // DOMException은 무시하고 계속 진행 (콘솔 경고도 남기지 않음)
+          if (error instanceof DOMException) {
+            return true;
+          }
+          // 콘솔 오염 방지: background 로그로만 남김
+          logToBackground(`다음 페이지 이동 중 오류(콘솔 억제): ${error?.message || String(error)}`, 'warning');
+          // Fallback: 라벨 기반으로 한 번 더 클릭 시도
+          try {
+            const expectedLabel = buttonIndex - 1;
+            const container =
+              document.querySelector('#sdpReview div[data-page]') ||
+              document.querySelector('#sdpReview div.twc-overflow-hidden div:nth-child(5) > div') ||
+              document.querySelector('#sdpReview div.twc-overflow-hidden') ||
+              document.querySelector('#sdpReview');
+            const buttons = container ? Array.from(container.querySelectorAll('button')) : [];
+            const fallbackBtn = buttons.find(b => {
+              const text = (b.textContent || '').trim();
+              return text === String(expectedLabel) && !b.disabled;
+            });
+            if (fallbackBtn) {
+              try {
+                fallbackBtn.click();
+                return true;
+              } catch (e) {
               }
             }
-
-            resolve(true);
-          } catch (clickError) {
-            resolve(false);
+          } catch (e) {
           }
-        } else {
-          resolve(false);
+          return false;
         }
-      });
+      })();
     }
 
     /**
      * 현재 페이지 번호 가져오기
-     * @returns {number} - 현재 페이지 번호 (기본값: 1)
+     * @returns {number|null} - 현재 페이지 번호 (파악 불가 시 null)
      */
-    function getCurrentPageNumber() {
+    function getPaginationInfo() {
       try {
         const sdpReview = safeQuerySelector('#sdpReview');
-        if (!sdpReview) return 1;
-
-        const activeButton = safeQuerySelector(
-          'button[aria-current="page"], button[class*="active"]',
-          sdpReview
-        );
-        if (activeButton) {
-          const text = safeGetText(activeButton);
-          const num = Number.parseInt(text, 10);
-          if (!Number.isNaN(num) && num > 0) return num;
+        if (!sdpReview) {
+          return { container: null, numbers: [], blockStart: null, blockEnd: null, activePage: null };
         }
+
+        const rectIntersects = (a, b) => {
+          if (!a || !b) return false;
+          return a.right > b.left && a.left < b.right && a.bottom > b.top && a.top < b.bottom;
+        };
+
+        const isVisible = (el, clipRect = null) => {
+          try {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect?.();
+            if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+            if (clipRect && !rectIntersects(rect, clipRect)) return false;
+            const style = getComputedStyle(el);
+            if (!style) return true;
+            const opacity = Number.parseFloat(style.opacity || '1');
+            return style.display !== 'none' && style.visibility !== 'hidden' && opacity !== 0;
+          } catch (e) {
+            // getComputedStyle 실패 시에는 일단 보이는 것으로 취급
+            return true;
+          }
+        };
+
+        const isNumericButton = (btn) => {
+          const t = (btn?.textContent || '').trim();
+          return /^\d{1,4}$/.test(t);
+        };
+
+        const candidateContainers = [
+          // 페이지네이션 래퍼(가장 우선)
+          safeQuerySelector('#sdpReview div[data-page]'),
+          safeQuerySelector('#sdpReview nav'),
+          safeQuerySelector('#sdpReview div.twc-overflow-hidden div:nth-child(5) > div'),
+          safeQuerySelector('#sdpReview div.twc-overflow-hidden'),
+          // 최후 폴백
+          sdpReview
+        ].filter(Boolean);
+
+        const getVisibleNumericButtons = (container) => {
+          try {
+            const clipRect = container?.getBoundingClientRect?.() || null;
+            return Array.from(container.querySelectorAll('button, a'))
+              .filter(isNumericButton)
+              // overflow-hidden/transform 등으로 "실제로는 안 보이는" 숫자 버튼을 제외하기 위해
+              // 컨테이너 rect와의 교차 여부까지 체크한다.
+              .filter((el) => isVisible(el, clipRect));
+          } catch (e) {
+            return [];
+          }
+        };
+
+        // 가장 "페이지네이션"에 가까운 컨테이너를 선택:
+        // (1) 우선순위 컨테이너 중 "숫자 버튼"이 존재하는 첫 번째
+        // (2) 없으면 최후 폴백(#sdpReview)
+        let bestContainer = sdpReview;
+        let bestButtons = getVisibleNumericButtons(bestContainer);
+        for (const c of candidateContainers) {
+          const btns = getVisibleNumericButtons(c);
+          if (btns.length >= 2) {
+            bestContainer = c;
+            bestButtons = btns;
+            break;
+          }
+        }
+
+        const numbers = bestButtons
+          .map(b => Number.parseInt((b.textContent || '').trim(), 10))
+          .filter(n => !Number.isNaN(n));
+        const unique = Array.from(new Set(numbers)).sort((a, b) => a - b);
+        const blockStart = unique.length ? unique[0] : null;
+        const blockEnd = unique.length ? unique[unique.length - 1] : null;
+
+        // active page는 "보이는 숫자 버튼" 중에서만 판별
+        const activeBtn =
+          bestButtons.find(b => b.getAttribute('aria-current') === 'page' || b.getAttribute('aria-current') === 'true') ||
+          // classList.contains는 실제 class 문자열을 사용해야 함 (이스케이프 문자열 사용 금지)
+          bestButtons.find(b => b.classList?.contains('twc-font-bold') && b.classList?.contains('twc-text-[#346aff]')) ||
+          bestButtons.find(b => b.classList?.contains('twc-font-bold')) ||
+          null;
+        const activePage = activeBtn ? Number.parseInt((activeBtn.textContent || '').trim(), 10) : null;
+
+        return { container: bestContainer, numbers: unique, blockStart, blockEnd, activePage: Number.isNaN(activePage) ? null : activePage };
       } catch (e) {
-        // 에러 발생 시 기본값 반환
+        return { container: null, numbers: [], blockStart: null, blockEnd: null, activePage: null };
       }
-      return 1;
+    }
+
+    function getCurrentPageNumber() {
+      try {
+        const info = getPaginationInfo();
+        return info.activePage;
+      } catch (e) {
+      }
+      return null;
+    }
+
+    /**
+     * 첫 리뷰 기반 DOM 시그니처 (페이지 이동 감지용)
+     * @returns {string}
+     */
+    function getFirstReviewSignatureFromDom() {
+      try {
+        const container = safeQuerySelector('#sdpReview') || document;
+        // 상단 안내/요약(article로 렌더되는 경우 포함)을 시그니처에 쓰면 페이지 이동 감지가 깨짐.
+        // data-review-id가 있는 "실제 리뷰 카드"만 대상으로 시그니처를 만든다.
+        const candidates = Array.from(safeQuerySelectorAll('article, div[class*="review"], div[class*="comment"]', container));
+        const reviewCards = candidates.filter((el) => {
+          if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+          const hasReviewId =
+            el.hasAttribute('data-review-id') ||
+            el.hasAttribute('data-reviewid') ||
+            !!safeQuerySelector('[data-review-id],[data-reviewid]', el);
+          // 일부 페이지/로딩 상태에서는 data-review-id가 늦게 붙거나 없을 수 있어, 작성자/날짜 기반으로도 리뷰로 인정
+          const hasMember = !!safeQuerySelector('[data-member-id]', el);
+          const hasTime = !!safeQuerySelector('time', el);
+          return hasReviewId || (hasMember && hasTime);
+        });
+        const topCards = reviewCards.slice(0, 3);
+        if (!topCards.length) return '';
+
+        const pageNum = getCurrentPageNumber();
+        const parts = topCards.map(a => {
+          const rid =
+            a.getAttribute('data-review-id') ||
+            a.getAttribute('data-reviewid') ||
+            (safeQuerySelector('[data-review-id],[data-reviewid]', a)?.getAttribute('data-review-id') ||
+              safeQuerySelector('[data-review-id],[data-reviewid]', a)?.getAttribute('data-reviewid')) ||
+            '';
+          const authorText = safeGetText(safeQuerySelector('[data-member-id]', a)).substring(0, 30);
+          const dateText = safeGetText(safeQuerySelector('time', a)).substring(0, 30);
+          const key = `${rid}|${authorText}|${dateText}`;
+          return key;
+        });
+
+        return `p=${pageNum || 'na'};n=${topCards.length};${parts.join('||')}`;
+      } catch (e) {
+        return '';
+      }
     }
 
     // ==================== 유틸리티 함수 ====================
