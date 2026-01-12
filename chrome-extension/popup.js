@@ -697,40 +697,40 @@ function restoreState() {
           const keysToGet = storageKey ? [storageKey, 'lastCollection'] : ['lastCollection'];
 
           chrome.storage.local.get(keysToGet, (result) => {
-          // 현재 탭의 데이터를 우선적으로 확인
-          if (storageKey && result[storageKey] && result[storageKey].reviews) {
-            const collectionData = result[storageKey];
-            collectedReviews = collectionData.reviews;
+            // 현재 탭의 데이터를 우선적으로 확인
+            if (storageKey && result[storageKey] && result[storageKey].reviews) {
+              const collectionData = result[storageKey];
+              collectedReviews = collectionData.reviews;
 
-            // 선택된 별점 필터가 있으면 필터링 적용
-            if (selectedRatingFilters.length > 0) {
-              collectedReviews = collectedReviews.filter(review => {
-                const reviewRating = review.rating ? review.rating.toString() : '';
-                return selectedRatingFilters.includes(reviewRating);
-              });
+              // 선택된 별점 필터가 있으면 필터링 적용
+              if (selectedRatingFilters.length > 0) {
+                collectedReviews = collectedReviews.filter(review => {
+                  const reviewRating = review.rating ? review.rating.toString() : '';
+                  return selectedRatingFilters.includes(reviewRating);
+                });
+              }
+
+              const isStopped = collectionData.stopped || false;
+              filteredReviews = [...collectedReviews];
+              showResults(collectedReviews.length, isStopped);
             }
+            // 현재 탭에 데이터가 없으면 lastCollection 확인
+            else if (result.lastCollection && result.lastCollection.reviews) {
+              collectedReviews = result.lastCollection.reviews;
 
-            const isStopped = collectionData.stopped || false;
-            filteredReviews = [...collectedReviews];
-            showResults(collectedReviews.length, isStopped);
-          }
-          // 현재 탭에 데이터가 없으면 lastCollection 확인
-          else if (result.lastCollection && result.lastCollection.reviews) {
-            collectedReviews = result.lastCollection.reviews;
+              // 선택된 별점 필터가 있으면 필터링 적용
+              if (selectedRatingFilters.length > 0) {
+                collectedReviews = collectedReviews.filter(review => {
+                  const reviewRating = review.rating ? review.rating.toString() : '';
+                  return selectedRatingFilters.includes(reviewRating);
+                });
+              }
 
-            // 선택된 별점 필터가 있으면 필터링 적용
-            if (selectedRatingFilters.length > 0) {
-              collectedReviews = collectedReviews.filter(review => {
-                const reviewRating = review.rating ? review.rating.toString() : '';
-                return selectedRatingFilters.includes(reviewRating);
-              });
+              const isStopped = result.lastCollection.stopped || false;
+              filterReviewsByCurrentTab();
+              const displayCount = filteredReviews ? filteredReviews.length : 0;
+              showResults(displayCount, isStopped);
             }
-
-            const isStopped = result.lastCollection.stopped || false;
-            filterReviewsByCurrentTab();
-            const displayCount = filteredReviews ? filteredReviews.length : 0;
-            showResults(displayCount, isStopped);
-          }
             resolve();
           });
         });
