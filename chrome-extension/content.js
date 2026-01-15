@@ -42,6 +42,8 @@ const CONSTANTS = {
     PAGE_MOVE_POLL_TIMEOUT: 2000,
     // 필터 적용 후 추가 대기
     FILTER_APPLY: 120,
+    // 페이지 이동 후 필터 드롭다운 렌더링 대기 (300ms로 증가)
+    FILTER_DROPDOWN_RENDER: 300,
     // 페이지/블록 이동 후 추가 안정화 대기 (0이면 추가 대기 없음)
     AFTER_PAGE_NAVIGATION: 0,
     AFTER_BLOCK_NAVIGATION: 0
@@ -471,9 +473,11 @@ if (!window.__coupangReviewScraperLoaded) {
           isScraping = true;
           currentCollectedReviews = [];
 
+          // 멀티 필터 진행률 계산: 각 필터는 전체의 일정 비율을 차지
+          const filterProgress = Math.floor(((i + 1) / ratingFilters.length) * 90); // 90%까지는 필터별 진행률
           safeSendMessage({
             action: 'progress',
-            percent: Math.floor((i / ratingFilters.length) * 100),
+            percent: filterProgress,
             text: `${ratingName} 필터링 후 리뷰 수집 중... (${i + 1}/${ratingFilters.length})`,
             originalTabId: currentOriginalTabId
           });
@@ -509,6 +513,14 @@ if (!window.__coupangReviewScraperLoaded) {
           type: 'success'
         });
         actionLog(`멀티 필터 종료: 총 ${allCollectedReviews.length}개`);
+
+        // 프로그레스바를 100%로 업데이트
+        safeSendMessage({
+          action: 'progress',
+          percent: 100,
+          text: `수집 완료: 총 ${allCollectedReviews.length}개 리뷰`,
+          originalTabId: currentOriginalTabId
+        });
 
         safeSendMessage({
           action: 'complete',
@@ -792,6 +804,14 @@ if (!window.__coupangReviewScraperLoaded) {
             originalTabId: currentOriginalTabId
           });
         } else {
+          // 프로그레스바를 100%로 업데이트
+          sendMsg({
+            action: 'progress',
+            percent: 100,
+            text: `수집 완료: 총 ${allReviews.length}개 리뷰`,
+            originalTabId: currentOriginalTabId
+          });
+
           sendMsg({
             action: 'complete',
             reviews: allReviews,
@@ -1466,39 +1486,103 @@ if (!window.__coupangReviewScraperLoaded) {
           currentBlockIndex = Math.floor((prevPageNum - 1) / 10);
         }
 
-        // 블록 전환이 필요하면(11,21,...) next(12) 먼저 클릭
+        // 블록 전환이 필요하면(11,21,31,...) 고정 순서: button:nth-child(11) -> button:nth-child(2) -> button:nth-child(12)
         if (desiredBlockIndex > currentBlockIndex) {
           safeSendMessage({
             action: 'log',
-            message: `페이지 ${targetPage} 진입 전 블록 전환: currentBlock=${currentBlockIndex} -> desiredBlock=${desiredBlockIndex} (buttonIndex=12)`,
+            message: `페이지 ${targetPage} 진입 전 블록 전환: currentBlock=${currentBlockIndex} -> desiredBlock=${desiredBlockIndex} (고정 순서: buttonIndex=11 -> buttonIndex=2 -> buttonIndex=12)`,
             type: 'info'
           });
-          // next(12)를 눌렀다고 가정하지 말고, "블록 시작 숫자"가 바뀌었는지 확인한다.
+
           const desiredBlockStart = (desiredBlockIndex * 10) + 1;
+
+          // 1단계: 먼저 button:nth-child(11) 클릭 (현재 블록의 마지막 페이지로 이동: 10, 20, 30 등)
+          const movedToLast = await goToNextPage(11);
+          if (!movedToLast) {
+            safeSendMessage({
+              action: 'log',
+              message: `buttonIndex=11 클릭 실패. 블록 전환 불가능하여 종료합니다.`,
+              type: 'warning'
+            });
+            break;
+          }
+          await waitForPageReady();
+          await waitForReviewsSection();
+          await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+
+          // 2단계: button:nth-child(2) 클릭 (현재 블록의 첫 페이지로 이동: 1, 11, 21 등)
+          const movedToFirst = await goToNextPage(2);
+          if (!movedToFirst) {
+            safeSendMessage({
+              action: 'log',
+              message: `buttonIndex=2 클릭 실패. 블록 전환 불가능하여 종료합니다.`,
+              type: 'warning'
+            });
+            break;
+          }
+          await waitForPageReady();
+          await waitForReviewsSection();
+          await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+
+          // 3단계: button:nth-child(12) 클릭 (다음 블록으로 이동)
           const beforeBlockStart = paginationBefore.blockStart;
+          const beforePageNum = paginationBefore.activePage;
           let blockMoved = false;
           for (let attempt = 0; attempt < 3 && !blockMoved; attempt++) {
             const movedBlock = await goToNextPage(12);
-            if (!movedBlock) break;
+            if (!movedBlock) {
+              if (attempt === 0) {
+                safeSendMessage({
+                  action: 'log',
+                  message: `buttonIndex=12 클릭 실패`,
+                  type: 'warning'
+                });
+              }
+              break;
+            }
             await waitForPageReady();
             await waitForReviewsSection();
             await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
-            // 블록 전환 후 추가 대기 (전체 단축: 기본 0ms)
-            await sleep(CONSTANTS.WAIT_TIMES.AFTER_BLOCK_NAVIGATION);
+            await sleep(CONSTANTS.WAIT_TIMES.AFTER_BLOCK_NAVIGATION || CONSTANTS.WAIT_TIMES.LONG);
+
             const afterInfo = getPaginationInfo();
             const afterBlockStart = afterInfo.blockStart;
-            // 목표 블록 시작(21,31,41...)이 보이면 성공으로 간주
+            const afterPageNum = afterInfo.activePage;
+
+            // 목표 블록 시작(11,21,31...)이 보이면 성공으로 간주
             if (afterBlockStart !== null && afterBlockStart >= desiredBlockStart) {
               blockMoved = true;
               currentBlockIndex = Math.floor((afterBlockStart - 1) / 10);
+              safeSendMessage({
+                action: 'log',
+                message: `블록 전환 성공: 블록 ${currentBlockIndex} (시작 페이지: ${afterBlockStart})`,
+                type: 'success'
+              });
               break;
             }
-            // 변화가 없으면 조금 더 기다렸다가 재시도
-            await sleep(CONSTANTS.WAIT_TIMES.LONG);
-            // beforeBlockStart가 null인 경우에는 단순 재시도
+
+            // 페이지 번호가 증가했거나 블록이 변경되었으면 성공으로 간주
+            if (afterPageNum !== null && beforePageNum !== null && afterPageNum > beforePageNum) {
+              if (afterBlockStart !== null) {
+                blockMoved = true;
+                currentBlockIndex = Math.floor((afterBlockStart - 1) / 10);
+                safeSendMessage({
+                  action: 'log',
+                  message: `블록 전환 성공: 페이지 ${beforePageNum} -> ${afterPageNum}, 블록 ${currentBlockIndex}`,
+                  type: 'success'
+                });
+                break;
+              }
+            }
+
+            // 블록 변화 감지 (목표와 다를 수 있음)
             if (beforeBlockStart !== null && afterBlockStart !== null && afterBlockStart !== beforeBlockStart) {
-              // 일단 변화는 있었는데 목표 블록이 아니면(여러 번 클릭됨) 현재 값으로 동기화
               currentBlockIndex = Math.floor((afterBlockStart - 1) / 10);
+            }
+
+            // 변화가 없으면 재시도
+            if (attempt < 2) {
+              await sleep(CONSTANTS.WAIT_TIMES.LONG);
             }
           }
 
@@ -1510,6 +1594,7 @@ if (!window.__coupangReviewScraperLoaded) {
             });
             break;
           }
+
           await waitForReviewsSection();
         }
 
@@ -1597,8 +1682,8 @@ if (!window.__coupangReviewScraperLoaded) {
 
         // 2) 필터 확인/재적용 (이동 후!)
         if (currentRatingFilter && currentRatingFilter !== 'all') {
-          // 페이지 이동 후 필터 드롭다운이 렌더링될 때까지 대기
-          await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+          // 페이지 이동 후 필터 드롭다운이 렌더링될 때까지 대기 (300ms로 증가)
+          await sleep(CONSTANTS.WAIT_TIMES.FILTER_DROPDOWN_RENDER);
 
           // 필터 감지 재시도 로직 (최대 3회)
           let activeFilter = null;
@@ -1608,7 +1693,7 @@ if (!window.__coupangReviewScraperLoaded) {
           while (retryCount < maxRetries && !activeFilter) {
             activeFilter = detectCurrentRatingFilterValue();
             if (!activeFilter && retryCount < maxRetries - 1) {
-              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+              await sleep(CONSTANTS.WAIT_TIMES.FILTER_DROPDOWN_RENDER);
               retryCount++;
             } else {
               break;
@@ -1623,29 +1708,75 @@ if (!window.__coupangReviewScraperLoaded) {
               type: 'info'
             });
 
-            const applied = await ensureRatingFilterApplied(currentRatingFilter);
+            let applied = false;
+            let filterRetryCount = 0;
+            const maxFilterRetries = 3;
+
+            // 필터 재적용 재시도 로직 (최대 3회)
+            while (filterRetryCount < maxFilterRetries && !applied) {
+              applied = await ensureRatingFilterApplied(currentRatingFilter);
+              if (!applied && filterRetryCount < maxFilterRetries - 1) {
+                await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+                filterRetryCount++;
+              } else {
+                break;
+              }
+            }
+
             if (applied) {
               // 필터 재적용 후 검증
               await waitForPageReady();
               await waitForReviewsSection();
-              await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+              await sleep(CONSTANTS.WAIT_TIMES.FILTER_DROPDOWN_RENDER);
 
-              // 재적용 후 필터 상태 재확인
-              const verifiedFilter = detectCurrentRatingFilterValue();
+              // 재적용 후 필터 상태 재확인 (최대 3회)
+              let verifiedFilter = null;
+              let verifyRetryCount = 0;
+              const maxVerifyRetries = 3;
+
+              while (verifyRetryCount < maxVerifyRetries && !verifiedFilter) {
+                verifiedFilter = detectCurrentRatingFilterValue();
+                if (!verifiedFilter && verifyRetryCount < maxVerifyRetries - 1) {
+                  await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+                  verifyRetryCount++;
+                } else {
+                  break;
+                }
+              }
+
               if (verifiedFilter === currentRatingFilter) {
                 safeSendMessage({
                   action: 'log',
                   message: `필터 재적용 완료: '${currentRatingFilter}' 확인됨`,
-                  type: 'info'
+                  type: 'success'
                 });
               } else {
+                // 필터 재적용 검증 실패 → 수집 중단
+                const errorMsg = `필터 재적용 검증 실패: 현재='${verifiedFilter || '감지 실패'}', 목표='${currentRatingFilter}' → 이 페이지 수집 건너뜀`;
                 safeSendMessage({
                   action: 'log',
-                  message: `필터 재적용 후 검증 실패: 현재='${verifiedFilter || '감지 실패'}', 목표='${currentRatingFilter}' (계속 진행)`,
-                  type: 'warning'
+                  message: errorMsg,
+                  type: 'error'
                 });
+                throw new Error(errorMsg);
               }
+            } else {
+              // 필터 재적용 자체 실패 → 수집 중단
+              const errorMsg = `필터 재적용 실패: '${currentRatingFilter}' 적용 불가 → 이 페이지 수집 건너뜀`;
+              safeSendMessage({
+                action: 'log',
+                message: errorMsg,
+                type: 'error'
+              });
+              throw new Error(errorMsg);
             }
+          } else {
+            // 필터 상태 정상 유지 확인
+            safeSendMessage({
+              action: 'log',
+              message: `필터 상태 유지 확인: '${currentRatingFilter}' (재적용 불필요)`,
+              type: 'success'
+            });
           }
         }
 
@@ -1778,9 +1909,10 @@ if (!window.__coupangReviewScraperLoaded) {
 
       updateCurrentCollectedReviews();
 
+      // 프로그레스바를 100%로 업데이트
       safeSendMessage({
         action: 'progress',
-        percent: 95,
+        percent: 100,
         text: `수집 완료: 총 ${allReviews.length}개 리뷰`,
         originalTabId: currentOriginalTabId
       });
