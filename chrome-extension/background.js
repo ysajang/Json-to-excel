@@ -343,12 +343,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (request.action === 'progress') {
       const storageKey = originalTabId ? `collectionProgress_${originalTabId}` : 'collectionProgress';
-      chrome.storage.local.set({
+      const progressPayload = {
         [storageKey]: {
           percent: request.percent,
           text: request.text,
           timestamp: Date.now(),
           originalTabId: originalTabId
+        }
+      };
+      chrome.storage.local.set(progressPayload, () => {
+        const err = chrome.runtime.lastError?.message || '';
+        if (err && (err.includes('quota') || err.includes('QUOTA') || err.includes('QuotaBytes'))) {
+          chrome.storage.local.remove(storageKey, () => {
+            chrome.storage.local.set(progressPayload);
+          });
         }
       });
     }
@@ -377,7 +385,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           timestamp: Date.now()
         });
         if (logs.length > 200) logs.shift();
-        chrome.storage.local.set({ [logStorageKey]: logs });
+        chrome.storage.local.set({ [logStorageKey]: logs }, () => {
+          const err = chrome.runtime.lastError?.message || '';
+          if (err && (err.includes('quota') || err.includes('QUOTA') || err.includes('QuotaBytes'))) {
+            chrome.storage.local.remove(logStorageKey, () => {
+              const trimmed = logs.slice(-50);
+              chrome.storage.local.set({ [logStorageKey]: trimmed });
+            });
+          }
+        });
       });
     }
 
@@ -415,17 +431,45 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       source: request.source != null ? String(request.source) : ''
     };
 
-    if (originalTabId) {
-      const storageKey = `collection_${originalTabId}`;
-      chrome.storage.local.set({
-        [storageKey]: collectionData,
-        lastCollection: collectionData
-      });
-    } else {
-      chrome.storage.local.set({
-        lastCollection: collectionData
+    const TRIM_SIZES = [8000, 6000];
+    function setCompleteStorage(data) {
+      const payload = originalTabId
+        ? { [`collection_${originalTabId}`]: data, lastCollection: data }
+        : { lastCollection: data };
+      chrome.storage.local.set(payload, () => {
+        const err = chrome.runtime.lastError?.message || '';
+        if (err && (err.includes('quota') || err.includes('QUOTA') || err.includes('QuotaBytes'))) {
+          chrome.storage.local.get(null, (all) => {
+            const keys = all && typeof all === 'object' ? Object.keys(all) : [];
+            keys.forEach((key) => {
+              if (key.startsWith('collectionProgress_') || key.startsWith('collectionLogs_')) {
+                chrome.storage.local.remove(key);
+              }
+            });
+            if (originalTabId) {
+              chrome.storage.local.remove(`collection_${originalTabId}`);
+            }
+            chrome.storage.local.set(payload, () => {
+              if (chrome.runtime.lastError && data.reviews?.length) {
+                const tryTrim = (idx) => {
+                  if (idx >= TRIM_SIZES.length) return;
+                  const n = TRIM_SIZES[idx];
+                  const trimmed = { ...data, reviews: data.reviews.slice(-n) };
+                  const trimmedPayload = originalTabId
+                    ? { [`collection_${originalTabId}`]: trimmed, lastCollection: trimmed }
+                    : { lastCollection: trimmed };
+                  chrome.storage.local.set(trimmedPayload, () => {
+                    if (chrome.runtime.lastError) tryTrim(idx + 1);
+                  });
+                };
+                tryTrim(0);
+              }
+            });
+          });
+        }
       });
     }
+    setCompleteStorage(collectionData);
 
     try {
       chrome.runtime.sendMessage({
@@ -435,7 +479,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         originalTabId,
         productName: collectionData.productName,
         source: collectionData.source
-      }).catch(() => {});
+      }).catch(() => { });
     } catch (err) {
       // popup이 닫혀 있으면 무시
     }
@@ -508,18 +552,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       source: request.source != null ? String(request.source) : ''
     };
 
+    const TRIM_SIZES_STOPPED = [8000, 6000];
     if (request.reviews !== undefined) {
-      if (originalTabId) {
-        const storageKey = `collection_${originalTabId}`;
-        chrome.storage.local.set({
-          [storageKey]: collectionData,
-          lastCollection: collectionData
-        });
-      } else {
-        chrome.storage.local.set({
-          lastCollection: collectionData
+      function setStoppedStorage(data) {
+        const payload = originalTabId
+          ? { [`collection_${originalTabId}`]: data, lastCollection: data }
+          : { lastCollection: data };
+        chrome.storage.local.set(payload, () => {
+          const err = chrome.runtime.lastError?.message || '';
+          if (err && (err.includes('quota') || err.includes('QUOTA') || err.includes('QuotaBytes'))) {
+            const keysToRemove = originalTabId
+              ? [`collectionProgress_${originalTabId}`, `collectionLogs_${originalTabId}`, `collection_${originalTabId}`]
+              : [];
+            keysToRemove.forEach((key) => chrome.storage.local.remove(key));
+            chrome.storage.local.set(payload, () => {
+              if (chrome.runtime.lastError && data.reviews?.length) {
+                const tryTrim = (idx) => {
+                  if (idx >= TRIM_SIZES_STOPPED.length) return;
+                  const n = TRIM_SIZES_STOPPED[idx];
+                  const fallback = { ...data, reviews: data.reviews.slice(-n) };
+                  const fallbackPayload = originalTabId
+                    ? { [`collection_${originalTabId}`]: fallback, lastCollection: fallback }
+                    : { lastCollection: fallback };
+                  chrome.storage.local.set(fallbackPayload, () => {
+                    if (chrome.runtime.lastError) tryTrim(idx + 1);
+                  });
+                };
+                tryTrim(0);
+              }
+            });
+          }
         });
       }
+      setStoppedStorage(collectionData);
     }
 
     try {
@@ -530,7 +595,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         originalTabId,
         productName: collectionData.productName,
         source: collectionData.source
-      }).catch(() => {});
+      }).catch(() => { });
     } catch (err) {
     }
 

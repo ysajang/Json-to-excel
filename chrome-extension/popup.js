@@ -41,14 +41,25 @@ function sanitizeFilenamePart(str) {
 
 /**
  * Blob을 지정한 파일명으로 다운로드.
- * Chrome은 blob URL로 chrome.downloads.download() 호출 시 filename을 무시하고 blob URL의 UUID를 파일명으로 씀.
- * 그래서 <a download> 방식으로 트리거해 사용자 지정 파일명이 적용되도록 함.
+ * 파일명이 겹치면 덮어쓰기(conflictAction: 'overwrite').
  */
 function triggerBlobDownload(blob, filename) {
+  const name = filename || 'review.csv';
   const url = URL.createObjectURL(blob);
+  if (chrome.downloads && typeof chrome.downloads.download === 'function') {
+    chrome.downloads.download(
+      { url, filename: name, conflictAction: 'overwrite', saveAs: false },
+      () => {
+        setTimeout(() => {
+          try { URL.revokeObjectURL(url); } catch (e) { }
+        }, 1000);
+      }
+    );
+    return;
+  }
   const a = document.createElement('a');
   a.href = url;
-  a.download = filename || 'review.csv';
+  a.download = name;
   a.style.display = 'none';
   const body = document.body;
   if (body) {
@@ -63,32 +74,44 @@ function triggerBlobDownload(blob, filename) {
   }, 500);
 }
 
-/** 다운로드 파일명에 쓸 문자열(제품명, 사이트 구분) 반환. 현재 탭에서 제품명을 먼저 읽고, 없으면 저장된 제품명·탭 제목·'review' 순. source는 lastCollection에서 가져옴(쿠팡/스마트스토어/브랜드 구분) */
+/** 다운로드 파일명에 쓸 문자열(제품명, 사이트 구분) 반환. 저장된 수집 데이터(productName·source)를 우선 사용하고, 없으면 현재 탭 제품명·탭 제목·'review' 순. */
 async function getDownloadFilenameBase() {
   let nameBase = 'review';
+  let source = '';
+
   try {
-    const tabId = currentTabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
-    if (tabId) {
-      const name = await new Promise((resolve) => {
-        try {
-          chrome.tabs.sendMessage(tabId, { action: 'getProductName' }, (response) => {
-            if (chrome.runtime?.lastError) {
-              resolve('');
-              return;
-            }
-            resolve((response && response.productName) ? String(response.productName).trim() : '');
-          });
-        } catch (e) {
-          resolve('');
-        }
-      });
-      if (name) nameBase = sanitizeFilenamePart(name);
-      else nameBase = 'review';
+    const storageKey = currentTabId ? `collection_${currentTabId}` : null;
+    const keysToGet = storageKey ? [storageKey, 'lastCollection'] : ['lastCollection'];
+    const st = await chrome.storage.local.get(keysToGet).catch(() => ({}));
+    const collection = (storageKey && st[storageKey]) ? st[storageKey] : (st.lastCollection || null);
+    if (collection) {
+      if (collection.productName != null && String(collection.productName).trim()) {
+        nameBase = sanitizeFilenamePart(String(collection.productName).trim());
+      }
+      if (collection.source != null && String(collection.source).trim() && String(collection.source).trim() !== 'unknown') {
+        source = String(collection.source).trim();
+      }
     }
   } catch (e) { }
 
   if (nameBase === 'review' && productName && String(productName).trim()) {
     nameBase = sanitizeFilenamePart(productName);
+  }
+  if (nameBase === 'review') {
+    try {
+      const tabId = currentTabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+      if (tabId) {
+        const name = await new Promise((resolve) => {
+          try {
+            chrome.tabs.sendMessage(tabId, { action: 'getProductName' }, (response) => {
+              if (chrome.runtime?.lastError) { resolve(''); return; }
+              resolve((response && response.productName) ? String(response.productName).trim() : '');
+            });
+          } catch (e) { resolve(''); }
+        });
+        if (name) nameBase = sanitizeFilenamePart(name);
+      }
+    } catch (e) { }
   }
   if (nameBase === 'review') {
     try {
@@ -103,12 +126,12 @@ async function getDownloadFilenameBase() {
     } catch (e) { }
   }
 
-  let source = '';
-  try {
-    const st = await chrome.storage.local.get(['lastCollection']).catch(() => ({}));
-    source = (st.lastCollection && st.lastCollection.source) ? String(st.lastCollection.source).trim() : '';
-  } catch (e) { }
-
+  if (!source || source === 'unknown') {
+    try {
+      const st = await chrome.storage.local.get(['lastCollection']).catch(() => ({}));
+      source = (st.lastCollection && st.lastCollection.source) ? String(st.lastCollection.source).trim() : '';
+    } catch (e) { }
+  }
   if (!source || source === 'unknown') {
     try {
       const tabIdForUrl = currentTabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
@@ -405,7 +428,7 @@ stopBtn.addEventListener('click', async () => {
 
 
 downloadJsonBtn.addEventListener('click', async () => {
-  const reviews = ensureReviewsArray(collectedReviews);
+  const reviews = ensureReviewsArray(filteredReviews);
   if (reviews.length === 0) {
     showStatus('다운로드할 리뷰가 없습니다.', 'error');
     return;
@@ -424,7 +447,7 @@ downloadJsonBtn.addEventListener('click', async () => {
 
 
 downloadExcelBtn.addEventListener('click', async () => {
-  const reviews = ensureReviewsArray(collectedReviews);
+  const reviews = ensureReviewsArray(filteredReviews);
   if (reviews.length === 0) {
     showStatus('다운로드할 리뷰가 없습니다.', 'error');
     return;

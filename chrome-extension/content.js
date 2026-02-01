@@ -72,7 +72,9 @@ const CONSTANTS = {
     MAX_CONTENT_LENGTH: 15000,
     MIN_ELEMENT_TEXT_LENGTH: 10,
     MAX_ELEMENT_TEXT_LENGTH: 5000,
-    MIN_REVIEW_ELEMENTS: 5
+    MIN_REVIEW_ELEMENTS: 5,
+    // 수집 개수 제한: null = 무제한, 숫자면 해당 개수에서 수집 중단 (제한 해제 = null)
+    MAX_COLLECTION_REVIEWS: null
   },
   // 메시지
   NO_REVIEW_MESSAGES: [
@@ -99,6 +101,13 @@ const SITE_SELECTORS = {
     reviewSection: 'div[class*="HTT4L8U0CU"]',
     reviewList: 'ul[class*="RR2FSL9wTc"]',
     reviewCard: 'ul[class*="RR2FSL9wTc"] > li, div[class*="HTT4L8U0CU"] li',
+    pagination: 'div[class*="L2CTE05CX2"]',
+    nextPage: 'div[class*="L2CTE05CX2"] a'
+  },
+  naverSmart: {
+    reviewSection: 'div[class*="HTT4L8U0CU"]',
+    reviewList: 'ul[class*="RR2FSL9wTc"]',
+    reviewCard: 'ul[class*="RR2FSL9wTc"] > li[class]',
     pagination: 'div[class*="L2CTE05CX2"]',
     nextPage: 'div[class*="L2CTE05CX2"] a'
   },
@@ -153,7 +162,7 @@ function getProductNameFromPage() {
 }
 
 function sendToUI(message) {
-  if (message.action === 'stopped' || message.action === 'startScraping' || message.action === 'complete') {
+  if (message.action === 'progress' || message.action === 'stopped' || message.action === 'startScraping' || message.action === 'complete') {
     try {
       window.postMessage({
         type: 'COUPANG_REVIEW_COLLECTOR',
@@ -573,12 +582,9 @@ if (!window.__coupangReviewScraperLoaded) {
 
           // 멀티 필터 진행률 계산: 각 필터는 전체의 일정 비율을 차지
           const filterProgress = Math.floor(((i + 1) / ratingFilters.length) * 90); // 90%까지는 필터별 진행률
-          safeSendMessage({
-            action: 'progress',
-            percent: filterProgress,
-            text: `${ratingName} 필터링 후 리뷰 수집 중... (${i + 1}/${ratingFilters.length})`,
-            originalTabId: currentOriginalTabId
-          });
+          const progressMsg = { action: 'progress', percent: filterProgress, text: `${ratingName} 필터링 후 리뷰 수집 중... (${i + 1}/${ratingFilters.length})`, originalTabId: currentOriginalTabId };
+          safeSendMessage(progressMsg);
+          sendToUI(progressMsg);
 
           const reviews = await collectAllReviews();
           actionLog(`필터 ${ratingFilter} 수집 완료: ${reviews.length}개`);
@@ -615,12 +621,9 @@ if (!window.__coupangReviewScraperLoaded) {
         actionLog(`멀티 필터 종료: 총 ${allCollectedReviews.length}개`);
 
         // 프로그레스바를 100%로 업데이트
-        safeSendMessage({
-          action: 'progress',
-          percent: 100,
-          text: `수집 완료: 총 ${allCollectedReviews.length}개 리뷰`,
-          originalTabId: currentOriginalTabId
-        });
+        const completeProgressMsg = { action: 'progress', percent: 100, text: `수집 완료: 총 ${allCollectedReviews.length}개 리뷰`, originalTabId: currentOriginalTabId };
+        safeSendMessage(completeProgressMsg);
+        sendToUI(completeProgressMsg);
 
         safeSendMessage({
           action: 'complete',
@@ -870,12 +873,9 @@ if (!window.__coupangReviewScraperLoaded) {
           type: 'info',
           originalTabId: currentOriginalTabId
         });
-        sendMsg({
-          action: 'progress',
-          percent: 5,
-          text: '리뷰 수집 준비 중...',
-          originalTabId: currentOriginalTabId
-        });
+        const prepMsg = { action: 'progress', percent: 5, text: '리뷰 수집 준비 중...', originalTabId: currentOriginalTabId };
+        sendMsg(prepMsg);
+        sendToUI(prepMsg);
         debugLog('collectAllReviews call', { rating: ratingFilter }, 'H2');
         const allReviews = await collectAllReviews();
         debugLog('collectAllReviews done', { rating: ratingFilter, count: allReviews.length }, 'H2');
@@ -929,12 +929,9 @@ if (!window.__coupangReviewScraperLoaded) {
           });
         } else {
           // 프로그레스바를 100%로 업데이트
-          sendMsg({
-            action: 'progress',
-            percent: 100,
-            text: `수집 완료: 총 ${allReviews.length}개 리뷰`,
-            originalTabId: currentOriginalTabId
-          });
+          const doneMsg = { action: 'progress', percent: 100, text: `수집 완료: 총 ${allReviews.length}개 리뷰`, originalTabId: currentOriginalTabId };
+          sendMsg(doneMsg);
+          sendToUI(doneMsg);
 
           sendMsg({
             action: 'complete',
@@ -1172,38 +1169,149 @@ if (!window.__coupangReviewScraperLoaded) {
         if (isNaver) {
           (async () => {
             try {
-              const reviewTabSelectors = [
-                'li a[data-name="REVIEW"]',
-                'li.yg0fOdRhWZ a',
-                'a[data-shp-area="tab.select"][data-name="REVIEW"]',
-                'li[role="presentation"] a[href="#"]'
-              ];
-              let reviewTab = null;
-              for (const sel of reviewTabSelectors) {
-                const els = document.querySelectorAll(sel);
-                for (const el of els) {
-                  const text = (el.textContent || '').trim();
-                  if (text === '리뷰' && el.offsetParent !== null) {
-                    reviewTab = el;
+              let toClick = null;
+              if (isNaverSmart) {
+                const smartStoreTabSelector = 'a[data-name="REVIEW"][data-shp-area="tab.select"]';
+                const maxWaitMs = 15000;
+                const pollIntervalMs = 350;
+                let waited = 0;
+                while (waited < maxWaitMs && !stopScraping) {
+                  const el = document.querySelector(smartStoreTabSelector);
+                  if (el && (el.offsetParent !== null || el.getBoundingClientRect().height > 0)) {
+                    toClick = el;
+                    break;
+                  }
+                  await sleep(pollIntervalMs);
+                  waited += pollIntervalMs;
+                }
+                if (!toClick) {
+                  const smartStoreReviewTabSelectors = [
+                    'a[data-name="REVIEW"][data-shp-area="tab.select"][role="menuitem"]',
+                    'a[href="#"][data-name="REVIEW"][data-shp-area="tab.select"]'
+                  ];
+                  for (const sel of smartStoreReviewTabSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && (el.offsetParent !== null || el.getBoundingClientRect().height > 0)) {
+                      toClick = el;
+                      break;
+                    }
+                  }
+                }
+                if (!toClick) {
+                  const menubar = document.querySelector('ul[class*="ercOWA57kn"][role="menubar"]') || document.querySelector('ul.ercOWA57kn') || document.querySelector('ul[role="menubar"]');
+                  if (menubar) {
+                    menubar.scrollIntoView({ block: 'center', behavior: 'smooth' }).catch(() => {});
+                    await sleep(400);
+                    const lis = menubar.querySelectorAll('li[class*="yg0fOdRhWZ"], li.yg0fOdRhWZ, li');
+                    for (const li of lis) {
+                      const a = li.querySelector('a[data-name="REVIEW"]');
+                      if (a && (li.offsetParent !== null || a.offsetParent !== null)) {
+                        toClick = a;
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (!toClick) {
+                  const byDataName = document.querySelectorAll('a[data-name="REVIEW"]');
+                  for (const el of byDataName) {
+                    if (el.offsetParent !== null && el.getAttribute('aria-hidden') !== 'true') {
+                      toClick = el;
+                      break;
+                    }
+                  }
+                }
+                if (!toClick) {
+                  const reviewTabSelectors = [
+                    'a[data-shp-area="tab.select"][data-name="REVIEW"]',
+                    'li a[data-name="REVIEW"]',
+                    'li.yg0fOdRhWZ a',
+                    'li[role="presentation"] a[href="#"]',
+                    '[role="tab"]'
+                  ];
+                  for (const sel of reviewTabSelectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                      const text = (el.textContent || '').trim();
+                      if ((text === '리뷰' || text === 'REVIEW' || text.startsWith('리뷰')) && el.offsetParent !== null) {
+                        toClick = el;
+                        break;
+                      }
+                    }
+                    if (toClick) break;
+                  }
+                }
+                if (!toClick) {
+                  const allLinks = document.querySelectorAll('a[href="#"], a[role="tab"], li a, button');
+                  for (const a of allLinks) {
+                    const text = (a.textContent || '').trim();
+                    if ((text === '리뷰' || text.startsWith('리뷰')) && a.offsetParent !== null) {
+                      toClick = a;
+                      break;
+                    }
+                  }
+                }
+              }
+              if (!toClick && !isNaverSmart) {
+                const byDataName = document.querySelectorAll('a[data-name="REVIEW"]');
+                for (const el of byDataName) {
+                  if (el.offsetParent !== null && el.getAttribute('aria-hidden') !== 'true') {
+                    toClick = el;
                     break;
                   }
                 }
-                if (reviewTab) break;
               }
-              if (!reviewTab) {
+              if (!toClick && isNaver) {
+                const reviewTabSelectors = [
+                  'li a[data-name="REVIEW"]',
+                  'li.yg0fOdRhWZ a',
+                  'a[data-shp-area="tab.select"][data-name="REVIEW"]',
+                  'li[role="presentation"] a[href="#"]'
+                ];
+                for (const sel of reviewTabSelectors) {
+                  const els = document.querySelectorAll(sel);
+                  for (const el of els) {
+                    const text = (el.textContent || '').trim();
+                    if ((text === '리뷰' || text.startsWith('리뷰')) && el.offsetParent !== null) {
+                      toClick = el;
+                      break;
+                    }
+                  }
+                  if (toClick) break;
+                }
+              }
+              if (!toClick && isNaver) {
                 const allLinks = document.querySelectorAll('li a, a[href="#"]');
                 for (const a of allLinks) {
                   const text = (a.textContent || '').trim();
-                  if (text === '리뷰' && a.offsetParent !== null) {
-                    reviewTab = a;
+                  if ((text === '리뷰' || text.startsWith('리뷰')) && a.offsetParent !== null) {
+                    toClick = a;
                     break;
                   }
                 }
               }
-              if (reviewTab) {
-                reviewTab.click();
+              if (toClick) {
+                toClick.scrollIntoView({ block: 'center', behavior: 'smooth' }).catch(() => {});
+                await sleep(400);
+                toClick.focus?.();
+                toClick.click();
                 await sleep(500);
                 await new Promise(r => setTimeout(r, 500));
+                if (isNaverSmart) {
+                  const sectionSelector = 'div[class*="HTT4L8U0CU"], ul[class*="RR2FSL9wTc"]';
+                  let sectionEl = document.querySelector(sectionSelector);
+                  let sectionWaited = 0;
+                  const sectionMaxWaitMs = 8000;
+                  while (!sectionEl && sectionWaited < sectionMaxWaitMs && !stopScraping) {
+                    await sleep(400);
+                    sectionWaited += 400;
+                    sectionEl = document.querySelector(sectionSelector);
+                  }
+                  if (sectionEl) {
+                    sectionEl.scrollIntoView({ block: 'start', behavior: 'smooth' }).catch(() => {});
+                    await sleep(500);
+                  }
+                }
               }
             } catch (e) { }
             resolve();
@@ -1674,12 +1782,9 @@ if (!window.__coupangReviewScraperLoaded) {
       currentCollectedReviews = allReviews;
 
       if (isNaver) {
-        safeSendMessage({
-          action: 'progress',
-          percent: 10,
-          text: '첫 페이지 리뷰 추출 중... (네이버)',
-          originalTabId: currentOriginalTabId
-        });
+        const naverFirstMsg = { action: 'progress', percent: 10, text: '첫 페이지 리뷰 추출 중... (네이버)', originalTabId: currentOriginalTabId };
+        safeSendMessage(naverFirstMsg);
+        sendToUI(naverFirstMsg);
         let pageReviews = await extractReviewsFromPage();
         for (const r of pageReviews) {
           if (stopScraping) break;
@@ -1698,12 +1803,9 @@ if (!window.__coupangReviewScraperLoaded) {
         let pageNum = 1;
         while (!stopScraping && (await goToNextPageNaver())) {
           pageNum++;
-          safeSendMessage({
-            action: 'progress',
-            percent: Math.min(90, 15 + pageNum * 5),
-            text: `${allReviews.length}개 리뷰 수집 중... (네이버 페이지 ${pageNum})`,
-            originalTabId: currentOriginalTabId
-          });
+          const naverPageMsg = { action: 'progress', percent: Math.min(90, 15 + pageNum * 5), text: `${allReviews.length}개 리뷰 수집 중... (네이버 페이지 ${pageNum})`, originalTabId: currentOriginalTabId };
+          safeSendMessage(naverPageMsg);
+          sendToUI(naverPageMsg);
           pageReviews = await extractReviewsFromPage();
           for (const r of pageReviews) {
             if (stopScraping) break;
@@ -1719,13 +1821,19 @@ if (!window.__coupangReviewScraperLoaded) {
             if (!isDuplicateReview(safe, allReviews)) allReviews.push(safe);
           }
           currentCollectedReviews = [...allReviews];
+          const maxReviews = CONSTANTS.REVIEW.MAX_COLLECTION_REVIEWS;
+          if (maxReviews != null && typeof maxReviews === 'number' && allReviews.length >= maxReviews) {
+            safeSendMessage({
+              action: 'log',
+              message: `수집 개수 제한 도달: ${maxReviews}개 → 수집 종료`,
+              type: 'info'
+            });
+            break;
+          }
         }
-        safeSendMessage({
-          action: 'progress',
-          percent: 100,
-          text: `수집 완료: 총 ${allReviews.length}개 리뷰`,
-          originalTabId: currentOriginalTabId
-        });
+        const naverDoneMsg = { action: 'progress', percent: 100, text: `수집 완료: 총 ${allReviews.length}개 리뷰`, originalTabId: currentOriginalTabId };
+        safeSendMessage(naverDoneMsg);
+        sendToUI(naverDoneMsg);
         return allReviews;
       }
 
@@ -1758,12 +1866,9 @@ if (!window.__coupangReviewScraperLoaded) {
       const noReviewMessages = CONSTANTS.NO_REVIEW_MESSAGES;
 
       // 첫 페이지 리뷰 추출 (필터링 후에는 이미 필터링된 첫 페이지 리뷰가 표시됨)
-      safeSendMessage({
-        action: 'progress',
-        percent: 10,
-        text: '첫 페이지 리뷰 추출 중...',
-        originalTabId: currentOriginalTabId
-      });
+      const firstMsg = { action: 'progress', percent: 10, text: '첫 페이지 리뷰 추출 중...', originalTabId: currentOriginalTabId };
+      safeSendMessage(firstMsg);
+      sendToUI(firstMsg);
 
       // 첫 페이지 리뷰 추출 (한 번만 수행)
       let firstPageReviews = await extractReviewsFromPage();
@@ -1796,12 +1901,9 @@ if (!window.__coupangReviewScraperLoaded) {
       }
 
       if (firstPageReviews.length > 0) {
-        safeSendMessage({
-          action: 'progress',
-          percent: 15,
-          text: `첫 페이지: ${firstPageReviews.length}개 리뷰 발견`,
-          originalTabId: currentOriginalTabId
-        });
+        const firstFoundMsg = { action: 'progress', percent: 15, text: `첫 페이지: ${firstPageReviews.length}개 리뷰 발견`, originalTabId: currentOriginalTabId };
+        safeSendMessage(firstFoundMsg);
+        sendToUI(firstFoundMsg);
         for (const review of firstPageReviews) {
           const isDuplicate = isDuplicateReview(review, allReviews);
           if (!isDuplicate) {
@@ -2262,12 +2364,19 @@ if (!window.__coupangReviewScraperLoaded) {
           });
         }
 
-        safeSendMessage({
-          action: 'progress',
-          percent: Math.min(90, 15 + (logicalPage * 5)),
-          text: `${allReviews.length}개 리뷰 수집 중... (페이지 ${logicalPage})`,
-          originalTabId: currentOriginalTabId
-        });
+        const pageMsg = { action: 'progress', percent: Math.min(90, 15 + (logicalPage * 5)), text: `${allReviews.length}개 리뷰 수집 중... (페이지 ${logicalPage})`, originalTabId: currentOriginalTabId };
+        safeSendMessage(pageMsg);
+        sendToUI(pageMsg);
+
+        const maxReviews = CONSTANTS.REVIEW.MAX_COLLECTION_REVIEWS;
+        if (maxReviews != null && typeof maxReviews === 'number' && allReviews.length >= maxReviews) {
+          safeSendMessage({
+            action: 'log',
+            message: `수집 개수 제한 도달: ${maxReviews}개 → 수집 종료`,
+            type: 'info'
+          });
+          break;
+        }
 
         logicalPage += 1; // 다음 페이지로
         await sleep(CONSTANTS.WAIT_TIMES.SHORT);
@@ -2276,12 +2385,9 @@ if (!window.__coupangReviewScraperLoaded) {
       updateCurrentCollectedReviews();
 
       // 프로그레스바를 100%로 업데이트
-      safeSendMessage({
-        action: 'progress',
-        percent: 100,
-        text: `수집 완료: 총 ${allReviews.length}개 리뷰`,
-        originalTabId: currentOriginalTabId
-      });
+      const finalMsg = { action: 'progress', percent: 100, text: `수집 완료: 총 ${allReviews.length}개 리뷰`, originalTabId: currentOriginalTabId };
+      safeSendMessage(finalMsg);
+      sendToUI(finalMsg);
 
       if (allReviews.length === 0) {
         if (hasNoReviewsMessage) {
@@ -2335,17 +2441,28 @@ if (!window.__coupangReviewScraperLoaded) {
           const listEl = document.querySelector('ul[class*="RR2FSL9wTc"]');
           let reviewElements = [];
           if (listEl) {
-            reviewElements = Array.from(listEl.querySelectorAll(':scope > li')).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
+            if (isNaverSmart) {
+              reviewElements = Array.from(listEl.querySelectorAll(':scope > li[class]')).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
+              if (reviewElements.length === 0) {
+                reviewElements = Array.from(listEl.querySelectorAll(':scope > li')).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
+              }
+            } else {
+              reviewElements = Array.from(listEl.querySelectorAll(':scope > li')).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
+            }
           }
           if (reviewElements.length === 0) {
             const sectionEl = document.querySelector(`div[class*="${sectionClass}"]`);
             if (sectionEl) {
-              const lis = sectionEl.querySelectorAll('ul[class*="RR2FSL9wTc"] li, li');
+              const lis = isNaverSmart
+                ? sectionEl.querySelectorAll('ul[class*="RR2FSL9wTc"] > li[class], ul[class*="RR2FSL9wTc"] > li')
+                : sectionEl.querySelectorAll('ul[class*="RR2FSL9wTc"] li, li');
               reviewElements = Array.from(lis).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
             }
           }
           if (reviewElements.length === 0) {
-            const fallback = document.querySelectorAll(`div[class*="${sectionClass}"] li, ul[class*="RR2FSL9wTc"] li`);
+            const fallback = isNaverSmart
+              ? document.querySelectorAll('ul[class*="RR2FSL9wTc"] > li[class], ul[class*="RR2FSL9wTc"] > li')
+              : document.querySelectorAll(`div[class*="${sectionClass}"] li, ul[class*="RR2FSL9wTc"] li`);
             reviewElements = Array.from(fallback).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
           }
           for (const element of reviewElements) {
