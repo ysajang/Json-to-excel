@@ -383,7 +383,10 @@
           }
         }
 
-        // UI를 자동으로 닫기 (2초 후 - 탭이 닫히기 전에 알림 확인 가능)
+        // UI를 자동으로 닫기 (네이버 스마트스토어/브랜드스토어: 1초 후, 그 외: 2초 후)
+        const href = typeof window !== 'undefined' && window.location && window.location.href ? window.location.href : '';
+        const isNaverStore = href.includes('smartstore.naver.com') || href.includes('brand.naver.com');
+        const closeDelay = isNaverStore ? 1000 : 2000;
         setTimeout(() => {
           if (uiContainer) {
             uiContainer.style.opacity = '0';
@@ -394,7 +397,7 @@
               isUICreated = false;
             }, 300);
           }
-        }, 2000);
+        }, closeDelay);
       } else {
         // 기존 동작 (진행률 표시 포함)
         if (statusDiv) {

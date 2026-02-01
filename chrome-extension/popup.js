@@ -16,33 +16,138 @@ const copyTableBtn = document.getElementById('copyTableBtn');
 let isCollecting = false;
 let collectedReviews = null;
 let productId = null;
+let productName = null; // 다운로드 파일명용 제품명
 let filteredReviews = null;
 let currentPage = 1;
 const itemsPerPage = 10;
 let currentTabId = null;
 let selectedRatingFilters = []; // 선택된 별점 필터 저장
 
+/** 수집 데이터 정확성: reviews는 항상 배열로 유지 */
+function ensureReviewsArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value == null) return [];
+  if (typeof value === 'object' && Array.isArray(value.reviews)) return value.reviews;
+  return [];
+}
 
-function addLog(message, type = 'info') {
-  saveLogToStorage(message, type, new Date().toLocaleTimeString('ko-KR'));
+function sanitizeFilenamePart(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.trim()
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/\s+/g, '_')
+    .substring(0, 100);
+}
+
+/**
+ * Blob을 지정한 파일명으로 다운로드.
+ * Chrome은 blob URL로 chrome.downloads.download() 호출 시 filename을 무시하고 blob URL의 UUID를 파일명으로 씀.
+ * 그래서 <a download> 방식으로 트리거해 사용자 지정 파일명이 적용되도록 함.
+ */
+function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || 'review.csv';
+  a.style.display = 'none';
+  const body = document.body;
+  if (body) {
+    body.appendChild(a);
+    a.click();
+    body.removeChild(a);
+  } else {
+    a.click();
+  }
+  setTimeout(() => {
+    try { URL.revokeObjectURL(url); } catch (e) { }
+  }, 500);
+}
+
+/** 다운로드 파일명에 쓸 문자열(제품명, 사이트 구분) 반환. 현재 탭에서 제품명을 먼저 읽고, 없으면 저장된 제품명·탭 제목·'review' 순. source는 lastCollection에서 가져옴(쿠팡/스마트스토어/브랜드 구분) */
+async function getDownloadFilenameBase() {
+  let nameBase = 'review';
+  try {
+    const tabId = currentTabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+    if (tabId) {
+      const name = await new Promise((resolve) => {
+        try {
+          chrome.tabs.sendMessage(tabId, { action: 'getProductName' }, (response) => {
+            if (chrome.runtime?.lastError) {
+              resolve('');
+              return;
+            }
+            resolve((response && response.productName) ? String(response.productName).trim() : '');
+          });
+        } catch (e) {
+          resolve('');
+        }
+      });
+      if (name) nameBase = sanitizeFilenamePart(name);
+      else nameBase = 'review';
+    }
+  } catch (e) { }
+
+  if (nameBase === 'review' && productName && String(productName).trim()) {
+    nameBase = sanitizeFilenamePart(productName);
+  }
+  if (nameBase === 'review') {
+    try {
+      if (currentTabId) {
+        const tab = await chrome.tabs.get(currentTabId).catch(() => null);
+        if (tab?.title?.trim()) nameBase = sanitizeFilenamePart(tab.title);
+      }
+      if (nameBase === 'review') {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+        if (tab?.title?.trim()) nameBase = sanitizeFilenamePart(tab.title);
+      }
+    } catch (e) { }
+  }
+
+  let source = '';
+  try {
+    const st = await chrome.storage.local.get(['lastCollection']).catch(() => ({}));
+    source = (st.lastCollection && st.lastCollection.source) ? String(st.lastCollection.source).trim() : '';
+  } catch (e) { }
+
+  if (!source || source === 'unknown') {
+    try {
+      const tabIdForUrl = currentTabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+      if (tabIdForUrl) {
+        const tab = await chrome.tabs.get(tabIdForUrl).catch(() => null);
+        const url = (tab && tab.url) ? String(tab.url) : '';
+        if (/coupang\.com/.test(url) && (/\/vp\/products\//.test(url) || /\/products\//.test(url))) source = 'coupang';
+        else if (/smartstore\.naver\.com/.test(url) && /\/products\//.test(url)) source = 'smartstore';
+        else if (/brand\.naver\.com/.test(url) && /\/products\//.test(url)) source = 'brand';
+      }
+    } catch (e) { }
+  }
+
+  return { nameBase: nameBase || 'review', source: source || 'unknown' };
 }
 
 
-function saveLogToStorage(message, type, time) {
-  chrome.storage.local.get(['collectionLogs'], (result) => {
-    const logs = result.collectionLogs || [];
+function addLog(message, type = 'info') {
+  saveLogToStorage(message, type, new Date().toLocaleTimeString('ko-KR'), currentTabId);
+}
+
+function saveLogToStorage(message, type, time, tabId = null) {
+  const logKey = tabId ? `collectionLogs_${tabId}` : 'collectionLogs';
+  chrome.storage.local.get([logKey], (result) => {
+    const logs = result[logKey] || [];
     logs.push({ message, type, time, timestamp: Date.now() });
-
-    if (logs.length > 200) {
-      logs.shift();
-    }
-
-    chrome.storage.local.set({ collectionLogs: logs });
+    if (logs.length > 200) logs.shift();
+    chrome.storage.local.set({ [logKey]: logs });
   });
 }
 
 
 function loadLogsFromStorage() {
+  const logKey = currentTabId ? `collectionLogs_${currentTabId}` : 'collectionLogs';
+  chrome.storage.local.get([logKey], (result) => {
+    const logs = result[logKey] || [];
+    if (logs.length === 0) return;
+    // 필요 시 로그 UI에 반영 (현재는 저장만 탭별 격리)
+  });
 }
 
 
@@ -67,17 +172,39 @@ function normalizeCoupangUrl(url) {
   return url;
 }
 
+/**
+ * 네이버 스마트스토어/브랜드스토어 상품 URL을 정규화 (쿼리 제거 등)
+ * @param {string} url - 원본 네이버 상품 URL
+ * @returns {string} - 정규화된 URL (smartstore 또는 brand + /{store}/products/{productId})
+ */
+function normalizeNaverUrl(url) {
+  if (!url || typeof url !== 'string') {
+    return url;
+  }
+
+  // smartstore.naver.com/{store}/products/{productId}?...
+  let match = url.match(/^(https?:\/\/smartstore\.naver\.com\/[^/]+\/products\/\d+)/);
+  if (match) return match[1];
+  // brand.naver.com/{store}/products/{productId}?...
+  match = url.match(/^(https?:\/\/brand\.naver\.com\/[^/]+\/products\/\d+)/);
+  if (match) return match[1];
+  return url;
+}
+
 
 async function loadCurrentPageUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.url) {
       currentTabId = tab.id;
-
-      // URL 정규화: 쿼리 파라미터 제거
-      const normalizedUrl = normalizeCoupangUrl(tab.url);
+      const u = tab.url;
+      let normalizedUrl = u;
+      if (u.includes('coupang.com')) {
+        normalizedUrl = normalizeCoupangUrl(u);
+      } else if ((u.includes('smartstore.naver.com') || u.includes('brand.naver.com')) && u.includes('/products/')) {
+        normalizedUrl = normalizeNaverUrl(u);
+      }
       productUrlInput.value = normalizedUrl;
-
       productUrlInput.disabled = true;
     }
   } catch (error) {
@@ -90,15 +217,21 @@ if (startBtn) {
     let url = productUrlInput.value.trim();
 
     if (!url) {
-      showStatus('쿠팡 상품 URL을 입력해주세요.', 'error');
+      showStatus('쿠팡 또는 네이버 스마트스토어/브랜드스토어 상품 URL을 입력해주세요.', 'error');
       return;
     }
 
-    // URL 정규화: 쿼리 파라미터 제거
-    url = normalizeCoupangUrl(url);
+    const isCoupang = url.includes('coupang.com') && (url.includes('/vp/products/') || url.includes('/products/'));
+    const isNaver = (url.includes('smartstore.naver.com') || url.includes('brand.naver.com')) && url.includes('/products/');
 
-    if (!url.includes('coupang.com/vp/products/')) {
-      showStatus('유효한 쿠팡 상품 URL이 아닙니다.', 'error');
+    if (isCoupang) {
+      url = normalizeCoupangUrl(url);
+    } else if (isNaver) {
+      url = normalizeNaverUrl(url);
+    }
+
+    if (!isCoupang && !isNaver) {
+      showStatus('유효한 쿠팡 또는 네이버 스마트스토어/브랜드스토어 상품 URL이 아닙니다.', 'error');
       return;
     }
 
@@ -186,6 +319,7 @@ if (startBtn) {
           showStatus(`${filterName} 필터링 후 추출 시작...`, 'info');
         }
 
+        const isNaverUrl = url.includes('smartstore.naver.com') || url.includes('brand.naver.com');
         chrome.runtime.sendMessage(
           {
             action: 'startCollection',
@@ -193,7 +327,8 @@ if (startBtn) {
             productId: productId,
             originalTabId: currentTabId,
             ratingFilters: ratingFilters, // 배열로 전달
-            isMultiFilter: ratingFilters.length > 1
+            isMultiFilter: ratingFilters.length > 1,
+            tabId: isNaverUrl ? currentTabId : undefined
           },
           (bgResponse) => {
             if (chrome.runtime.lastError) {
@@ -208,6 +343,8 @@ if (startBtn) {
               if (ratingFilters.length > 1) {
                 addLog(`총 ${ratingFilters.length}개 별점 필터링 후 순차 수집이 시작되었습니다.`, 'success');
                 showStatus(`총 ${ratingFilters.length}개 별점 필터링 후 순차 수집이 시작되었습니다.`, 'success');
+              } else if (isNaverUrl) {
+                showStatus('수집이 시작되었습니다. 이 탭에서 진행됩니다...', 'success');
               } else {
                 showStatus('수집이 시작되었습니다. 새 창에서 진행됩니다...', 'success');
               }
@@ -268,127 +405,106 @@ stopBtn.addEventListener('click', async () => {
 
 
 downloadJsonBtn.addEventListener('click', async () => {
-  if (!collectedReviews) return;
-
-  let tabTitle = 'review';
-  try {
-    if (currentTabId) {
-      const tab = await chrome.tabs.get(currentTabId);
-      if (tab && tab.title) {
-        tabTitle = tab.title
-          .replace(/[<>:"/\\|?*]/g, '_')
-          .replace(/\s+/g, '_')
-          .substring(0, 100);
-      }
-    } else {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab && tab.title) {
-        tabTitle = tab.title
-          .replace(/[<>:"/\\|?*]/g, '_')
-          .replace(/\s+/g, '_')
-          .substring(0, 100);
-      }
-    }
-  } catch (error) {
+  const reviews = ensureReviewsArray(collectedReviews);
+  if (reviews.length === 0) {
+    showStatus('다운로드할 리뷰가 없습니다.', 'error');
+    return;
   }
-
-  const jsonData = JSON.stringify(collectedReviews, null, 2);
-  const blob = new Blob([jsonData], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-
-  const filename = `review_${tabTitle}.json`;
-
-  chrome.downloads.download({
-    url: url,
-    filename: filename,
-    saveAs: true
-  }, (downloadId) => {
-    if (chrome.runtime.lastError) {
-      showStatus('다운로드 실패: ' + chrome.runtime.lastError.message, 'error');
-    } else {
-      showStatus('JSON 파일 다운로드 완료.', 'success');
-    }
-  });
+  try {
+    const { nameBase, source } = await getDownloadFilenameBase();
+    const filename = `review_${nameBase}_${source}.json`;
+    const jsonData = JSON.stringify(reviews, null, 2);
+    const blob = new Blob([jsonData], { type: 'application/json' });
+    triggerBlobDownload(blob, filename);
+    showStatus('JSON 파일 다운로드 완료.', 'success');
+  } catch (e) {
+    showStatus('다운로드 실패: ' + (e?.message || String(e)), 'error');
+  }
 });
 
 
 downloadExcelBtn.addEventListener('click', async () => {
-  if (!collectedReviews) return;
-
-  let tabTitle = 'review';
-  try {
-    if (currentTabId) {
-      const tab = await chrome.tabs.get(currentTabId);
-      if (tab && tab.title) {
-        tabTitle = tab.title
-          .replace(/[<>:"/\\|?*]/g, '_')
-          .replace(/\s+/g, '_')
-          .substring(0, 100);
-      }
-    } else {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab && tab.title) {
-        tabTitle = tab.title
-          .replace(/[<>:"/\\|?*]/g, '_')
-          .replace(/\s+/g, '_')
-          .substring(0, 100);
-      }
-    }
-  } catch (error) {
+  const reviews = ensureReviewsArray(collectedReviews);
+  if (reviews.length === 0) {
+    showStatus('다운로드할 리뷰가 없습니다.', 'error');
+    return;
   }
-
-  chrome.runtime.sendMessage({
-    action: 'convertToExcel',
-    reviews: collectedReviews,
-    productId: productId
-  }, (response) => {
-    if (response && response.success && response.csvContent) {
-      const blob = new Blob([response.csvContent], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-
-      const filename = `review_${tabTitle}.csv`;
-
-      chrome.downloads.download({
-        url: url,
-        filename: filename,
-        saveAs: true
-      }, (downloadId) => {
-        setTimeout(() => {
-          URL.revokeObjectURL(url);
-        }, 500);
-
-        if (chrome.runtime.lastError) {
-          showStatus('다운로드 실패: ' + chrome.runtime.lastError.message, 'error');
-        } else {
-          showStatus('Excel 파일 다운로드가 시작되었습니다. (CSV 형식)', 'success');
-        }
-      });
-    } else {
-      showStatus('Excel 변환 실패: ' + (response?.error || '알 수 없는 오류'), 'error');
+  try {
+    const { nameBase, source } = await getDownloadFilenameBase();
+    // CSV 변환 함수
+    function escapeCsvValue(value) {
+      if (value === null || value === undefined) {
+        return '';
+      }
+      const stringValue = String(value);
+      // 쉼표, 따옴표, 줄바꿈이 있으면 따옴표로 감싸고 내부 따옴표는 이스케이프
+      if (stringValue.includes(',') || stringValue.includes('"') || stringValue.includes('\n') || stringValue.includes('\r')) {
+        return '"' + stringValue.replace(/"/g, '""') + '"';
+      }
+      return stringValue;
     }
-  });
+
+    // 헤더 정의
+    const headers = ['날짜', '작성자', '별점', '제목', '내용', '상품평가'];
+
+    // CSV 데이터 생성
+    const csvRows = [];
+
+    // 헤더 추가
+    csvRows.push(headers.map(escapeCsvValue).join(','));
+
+    // 데이터 행 추가
+    reviews.forEach(review => {
+      const row = [
+        review && review.date != null ? String(review.date) : '',
+        review && review.author != null ? String(review.author) : '',
+        review && review.rating != null ? String(review.rating) : '',
+        review && review.title != null ? String(review.title) : '',
+        review && review.content != null ? String(review.content) : '',
+        review && review.productEvaluation != null ? String(review.productEvaluation) : ''
+      ];
+      csvRows.push(row.map(escapeCsvValue).join(','));
+    });
+
+    // CSV 문자열 생성
+    const csvContent = csvRows.join('\n');
+
+    // UTF-8 BOM 추가 (한글 깨짐 방지)
+    const BOM = '\uFEFF';
+    const csvWithBom = BOM + csvContent;
+
+    // Blob 생성 (CSV 형식)
+    const blob = new Blob([csvWithBom], {
+      type: 'text/csv;charset=utf-8;'
+    });
+    const filename = `review_${nameBase}_${source}.csv`;
+
+    triggerBlobDownload(blob, filename);
+    showStatus('CSV 파일 다운로드가 시작되었습니다.', 'success');
+  } catch (error) {
+    showStatus('CSV 변환 실패: ' + (error?.message || String(error)), 'error');
+  }
 });
 
 
 // 테이블 복사 기능
 if (copyTableBtn) {
   copyTableBtn.addEventListener('click', async () => {
-    if (!filteredReviews || filteredReviews.length === 0) {
+    const list = ensureReviewsArray(filteredReviews);
+    if (list.length === 0) {
       showStatus('복사할 리뷰가 없습니다.', 'error');
       return;
     }
 
-    // 테이블 헤더 생성
     const headers = ['번호', '날짜', '작성자', '평점', '제목', '내용', '상품평가'];
 
-    // 모든 리뷰 데이터를 텍스트로 변환 (현재 페이지가 아닌 전체)
-    const rows = filteredReviews.map((review, index) => {
-      const date = review.date || '';
-      const author = review.author || '';
-      const rating = parseInt(review.rating) || 0;
-      const title = review.title || '';
-      const content = review.content || '';
-      const productEvaluation = review.productEvaluation || '';
+    const rows = list.map((review, index) => {
+      const date = review && review.date != null ? String(review.date) : '';
+      const author = review && review.author != null ? String(review.author) : '';
+      const rating = Number.parseInt(String(review?.rating ?? ''), 10) || 0;
+      const title = review && review.title != null ? String(review.title) : '';
+      const content = review && review.content != null ? String(review.content) : '';
+      const productEvaluation = review && review.productEvaluation != null ? String(review.productEvaluation) : '';
 
       // 탭으로 구분된 텍스트 형식
       return [
@@ -416,7 +532,7 @@ if (copyTableBtn) {
       const originalText = copyTableBtn.textContent;
       copyTableBtn.textContent = '✓ 복사됨';
       copyTableBtn.disabled = true;
-      showStatus(`테이블이 클립보드에 복사되었습니다. (${filteredReviews.length}개 리뷰)`, 'success');
+      showStatus(`테이블이 클립보드에 복사되었습니다. (${list.length}개 리뷰)`, 'success');
 
       // 2초 후 원래 텍스트로 복원
       setTimeout(() => {
@@ -476,9 +592,18 @@ function updateProgress(percent, text) {
 
 
 function updatePagination() {
-  if (!filteredReviews) return;
+  const list = ensureReviewsArray(filteredReviews);
+  if (list.length === 0) {
+    const pageInfo = document.getElementById('pageInfo');
+    if (pageInfo) pageInfo.textContent = '1 / 1';
+    const prevBtn = document.getElementById('prevPage');
+    const nextBtn = document.getElementById('nextPage');
+    if (prevBtn) prevBtn.disabled = true;
+    if (nextBtn) nextBtn.disabled = true;
+    return;
+  }
 
-  const totalPages = Math.ceil(filteredReviews.length / itemsPerPage);
+  const totalPages = Math.max(1, Math.ceil(list.length / itemsPerPage));
   const pageInfo = document.getElementById('pageInfo');
   if (pageInfo) {
     pageInfo.textContent = `${currentPage} / ${totalPages}`;
@@ -492,7 +617,8 @@ function updatePagination() {
 
 
 function renderReviewTable() {
-  if (!filteredReviews || filteredReviews.length === 0) {
+  const list = ensureReviewsArray(filteredReviews);
+  if (list.length === 0) {
     const tbody = document.getElementById('reviewTableBody');
     if (tbody) {
       tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 20px;">표시할 리뷰가 없습니다.</td></tr>';
@@ -503,7 +629,7 @@ function renderReviewTable() {
 
   const startIndex = (currentPage - 1) * itemsPerPage;
   const endIndex = startIndex + itemsPerPage;
-  const pageReviews = filteredReviews.slice(startIndex, endIndex);
+  const pageReviews = list.slice(startIndex, endIndex);
 
   const tbody = document.getElementById('reviewTableBody');
   if (!tbody) return;
@@ -514,12 +640,12 @@ function renderReviewTable() {
     const row = document.createElement('tr');
     const globalIndex = startIndex + index + 1;
 
-    const date = review.date || '날짜 없음';
-    const author = review.author || '작성자 없음';
-    const rating = parseInt(review.rating) || 0;
-    const title = review.title || '(제목 없음)';
-    const content = review.content || '(내용 없음)';
-    const productEvaluation = review.productEvaluation || '(평가 없음)';
+    const date = review && review.date != null ? String(review.date) : '날짜 없음';
+    const author = review && review.author != null ? String(review.author) : '작성자 없음';
+    const rating = Number.parseInt(String(review?.rating ?? ''), 10) || 0;
+    const title = review && review.title != null ? String(review.title) : '(제목 없음)';
+    const content = review && review.content != null ? String(review.content) : '(내용 없음)';
+    const productEvaluation = review && review.productEvaluation != null ? String(review.productEvaluation) : '(평가 없음)';
 
     const truncatedTitle = title.length > 30 ? title.substring(0, 30) + '...' : title;
     const truncatedContent = content.length > 50 ? content.substring(0, 50) + '...' : content;
@@ -543,15 +669,18 @@ function renderReviewTable() {
 
 
 function showResults(count, isStopped = false) {
+  const n = Number(count);
+  const safeCount = Number.isFinite(n) && n >= 0 ? n : 0;
   const statusText = isStopped
     ? '<strong>수집 중지됨</strong><br>'
     : '<strong>수집 완료!</strong><br>';
 
-  resultInfo.innerHTML = `
-    ${statusText}
-    총 <strong>${count}개</strong>의 리뷰가 수집되었습니다.
-  `;
-  resultsDiv.classList.remove('hidden');
+  if (resultInfo) {
+    resultInfo.innerHTML = `${statusText}총 <strong>${safeCount}개</strong>의 리뷰가 수집되었습니다.`;
+  }
+  if (resultsDiv) {
+    resultsDiv.classList.remove('hidden');
+  }
 
   filterReviewsByCurrentTab();
   currentPage = 1;
@@ -560,17 +689,17 @@ function showResults(count, isStopped = false) {
 
 
 function filterReviewsByCurrentTab() {
-  if (!collectedReviews) {
+  const reviews = ensureReviewsArray(collectedReviews);
+  if (reviews.length === 0) {
     filteredReviews = [];
     return;
   }
 
-  if (currentTabId) {
-    filteredReviews = collectedReviews.filter(review => {
-      return review.originalTabId && review.originalTabId.toString() === currentTabId.toString();
-    });
+  if (currentTabId != null) {
+    const tabStr = String(currentTabId);
+    filteredReviews = reviews.filter(review => review && review.originalTabId != null && String(review.originalTabId) === tabStr);
   } else {
-    filteredReviews = [...collectedReviews];
+    filteredReviews = [...reviews];
   }
 }
 
@@ -582,53 +711,49 @@ async function loadReviewsForCurrentTab() {
 
   const storageKey = `collection_${currentTabId}`;
   chrome.storage.local.get([storageKey, 'lastCollection'], (result) => {
-    // 현재 탭의 데이터를 우선적으로 확인
+    if (!result || typeof result !== 'object') return;
     if (result[storageKey] && result[storageKey].reviews) {
       const collectionData = result[storageKey];
-      collectedReviews = collectionData.reviews;
+      collectedReviews = ensureReviewsArray(collectionData.reviews);
+      productName = collectionData.productName != null ? String(collectionData.productName) : productName;
 
-      // 선택된 별점 필터가 있으면 필터링 적용
       if (selectedRatingFilters.length > 0) {
         collectedReviews = collectedReviews.filter(review => {
-          const reviewRating = review.rating ? review.rating.toString() : '';
+          const reviewRating = review && review.rating != null ? String(review.rating) : '';
           return selectedRatingFilters.includes(reviewRating);
         });
       }
 
-      const isStopped = collectionData.stopped || false;
       filteredReviews = [...collectedReviews];
-      showResults(collectedReviews.length, isStopped);
-    }
-    // 현재 탭에 데이터가 없으면 lastCollection 확인
-    else if (result.lastCollection && result.lastCollection.reviews) {
-      collectedReviews = result.lastCollection.reviews;
+      showResults(collectedReviews.length, Boolean(collectionData.stopped));
+    } else if (result.lastCollection && result.lastCollection.reviews) {
+      collectedReviews = ensureReviewsArray(result.lastCollection.reviews);
+      productName = result.lastCollection.productName != null ? String(result.lastCollection.productName) : productName;
 
-      // 선택된 별점 필터가 있으면 필터링 적용
       if (selectedRatingFilters.length > 0) {
         collectedReviews = collectedReviews.filter(review => {
-          const reviewRating = review.rating ? review.rating.toString() : '';
+          const reviewRating = review && review.rating != null ? String(review.rating) : '';
           return selectedRatingFilters.includes(reviewRating);
         });
       }
 
-      const isStopped = result.lastCollection.stopped || false;
       filterReviewsByCurrentTab();
-      const displayCount = filteredReviews ? filteredReviews.length : 0;
-      showResults(displayCount, isStopped);
+      showResults(filteredReviews ? filteredReviews.length : 0, Boolean(result.lastCollection.stopped));
     }
   });
 }
 
 
 function updateTabIdFilter() {
-  if (!collectedReviews) return;
+  const reviews = ensureReviewsArray(collectedReviews);
+  if (reviews.length === 0) return;
 
   const tabIdFilter = document.getElementById('tabIdFilter');
   if (!tabIdFilter) return;
 
   tabIdFilter.innerHTML = '<option value="all">모든 탭</option>';
 
-  const uniqueTabIds = [...new Set(collectedReviews.map(r => r.originalTabId).filter(id => id !== null && id !== undefined))];
+  const uniqueTabIds = [...new Set(reviews.map(r => r && r.originalTabId).filter(id => id !== null && id !== undefined))];
 
   uniqueTabIds.forEach(tabId => {
     const option = document.createElement('option');
@@ -700,36 +825,31 @@ function restoreState() {
             // 현재 탭의 데이터를 우선적으로 확인
             if (storageKey && result[storageKey] && result[storageKey].reviews) {
               const collectionData = result[storageKey];
-              collectedReviews = collectionData.reviews;
+              collectedReviews = ensureReviewsArray(collectionData.reviews);
+              productName = collectionData.productName != null ? String(collectionData.productName) : productName;
 
-              // 선택된 별점 필터가 있으면 필터링 적용
               if (selectedRatingFilters.length > 0) {
                 collectedReviews = collectedReviews.filter(review => {
-                  const reviewRating = review.rating ? review.rating.toString() : '';
+                  const reviewRating = review && review.rating != null ? String(review.rating) : '';
                   return selectedRatingFilters.includes(reviewRating);
                 });
               }
 
-              const isStopped = collectionData.stopped || false;
               filteredReviews = [...collectedReviews];
-              showResults(collectedReviews.length, isStopped);
-            }
-            // 현재 탭에 데이터가 없으면 lastCollection 확인
-            else if (result.lastCollection && result.lastCollection.reviews) {
-              collectedReviews = result.lastCollection.reviews;
+              showResults(collectedReviews.length, Boolean(collectionData.stopped));
+            } else if (result.lastCollection && result.lastCollection.reviews) {
+              collectedReviews = ensureReviewsArray(result.lastCollection.reviews);
+              productName = result.lastCollection.productName != null ? String(result.lastCollection.productName) : productName;
 
-              // 선택된 별점 필터가 있으면 필터링 적용
               if (selectedRatingFilters.length > 0) {
                 collectedReviews = collectedReviews.filter(review => {
-                  const reviewRating = review.rating ? review.rating.toString() : '';
+                  const reviewRating = review && review.rating != null ? String(review.rating) : '';
                   return selectedRatingFilters.includes(reviewRating);
                 });
               }
 
-              const isStopped = result.lastCollection.stopped || false;
               filterReviewsByCurrentTab();
-              const displayCount = filteredReviews ? filteredReviews.length : 0;
-              showResults(displayCount, isStopped);
+              showResults(filteredReviews ? filteredReviews.length : 0, Boolean(result.lastCollection.stopped));
             }
             resolve();
           });
@@ -759,18 +879,18 @@ function setupMessageListener() {
     } else if (message.action === 'log') {
       addLog(message.message, message.type || 'info');
     } else if (message.action === 'complete') {
-      collectedReviews = message.reviews;
-      const isStopped = message.stopped || false;
+      collectedReviews = ensureReviewsArray(message.reviews);
+      productName = message.productName != null ? String(message.productName) : productName;
+      const isStopped = Boolean(message.stopped);
 
-      // 선택된 별점 필터가 있으면 필터링 적용
       if (selectedRatingFilters.length > 0) {
         collectedReviews = collectedReviews.filter(review => {
-          const reviewRating = review.rating ? review.rating.toString() : '';
+          const reviewRating = review && review.rating != null ? String(review.rating) : '';
           return selectedRatingFilters.includes(reviewRating);
         });
-        addLog(`수집 완료: 총 ${message.reviews.length}개 중 선택한 별점(${selectedRatingFilters.join(',')}점) ${collectedReviews.length}개 리뷰`, 'success');
+        addLog(`수집 완료: 총 ${collectedReviews.length}개 중 선택한 별점(${selectedRatingFilters.join(',')}점) ${collectedReviews.length}개 리뷰`, 'success');
       } else {
-        addLog(`수집 완료: 총 ${message.reviews.length}개의 리뷰가 수집되었습니다.`, 'success');
+        addLog(`수집 완료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'success');
       }
 
       if (isStopped) {
@@ -786,7 +906,8 @@ function setupMessageListener() {
       window.messageListener = null;
     } else if (message.action === 'stopped') {
       if (message.reviews !== undefined) {
-        collectedReviews = message.reviews || [];
+        collectedReviews = ensureReviewsArray(message.reviews);
+        productName = message.productName != null ? String(message.productName) : productName;
         addLog(`수집 종료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'info');
         showStatus(message.message || `수집 종료: 총 ${collectedReviews.length}개의 리뷰가 수집되었습니다.`, 'info');
         filterReviewsByCurrentTab();

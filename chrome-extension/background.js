@@ -44,6 +44,31 @@ function detachDebugger(tabId) {
   });
 }
 
+// 탭이 있는 창을 닫는 헬퍼 함수
+function closeWindowByTabId(tabId) {
+  return new Promise((resolve) => {
+    if (!tabId) {
+      resolve(false);
+      return;
+    }
+
+    chrome.tabs.get(tabId)
+      .then((tab) => {
+        if (tab && tab.windowId) {
+          return chrome.windows.remove(tab.windowId);
+        }
+        return Promise.resolve(false);
+      })
+      .then(() => {
+        resolve(true);
+      })
+      .catch((err) => {
+        // 탭이 이미 닫혔거나 없는 경우, 창도 이미 닫혔을 수 있음
+        resolve(false);
+      });
+  });
+}
+
 function sendDebuggerCommand(tabId, method, params) {
   return new Promise((resolve, reject) => {
     try {
@@ -59,6 +84,7 @@ function sendDebuggerCommand(tabId, method, params) {
 }
 
 
+// 여러 탭 병렬 처리: collection/진행/로그는 originalTabId(또는 collectionTabId)별 키로 격리해 탭 간 간섭 없이 속도·정확성 유지
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'debug-click' && request.payload) {
     const tabId = sender?.tab?.id;
@@ -140,6 +166,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'startCollection') {
+    const isNaverStore = request.url && (String(request.url).includes('smartstore.naver.com') || String(request.url).includes('brand.naver.com'));
+    if (isNaverStore) {
+      console.log('[리뷰 수집기] [네이버 스마트스토어/브랜드스토어] 수집 요청', {
+        url: request.url,
+        productId: request.productId,
+        tabId: request.tabId,
+        useCurrentTab: !!request.tabId
+      });
+    }
+
     let originalTabId = null;
     if (request.originalTabId) {
       originalTabId = request.originalTabId;
@@ -242,28 +278,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
-    // 여러 필터인 경우 배열로 전달, 단일 필터인 경우 문자열로 전달
+    // 네이버 현재 탭 수집: content script가 없을 수 있으므로 먼저 주입 후 수집 시작
     const ratingFilter = request.ratingFilters && Array.isArray(request.ratingFilters)
       ? request.ratingFilters
       : (request.ratingFilter || 'all');
-    startCollection(request.url, request.tabId, request.productId, ratingFilter, originalTabId, request.isMultiFilter || false, originalTabId)
-      .then(() => {
-        try {
-          sendResponse({ success: true });
-        } catch (e) {
-        }
-      })
-      .catch(error => {
-        if (originalTabId) {
-          collectionsByTab.delete(originalTabId);
-        }
-        const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
-        chrome.storage.local.remove(storageKey);
-        try {
-          sendResponse({ success: false, error: error.message });
-        } catch (e) {
-        }
+    const runStartCollection = () => {
+      startCollection(request.url, request.tabId, request.productId, ratingFilter, originalTabId, request.isMultiFilter || false, originalTabId)
+        .then(() => {
+          try {
+            sendResponse({ success: true });
+          } catch (e) {
+          }
+        })
+        .catch(error => {
+          if (originalTabId) {
+            collectionsByTab.delete(originalTabId);
+          }
+          const storageKey = originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus';
+          chrome.storage.local.remove(storageKey);
+          try {
+            sendResponse({ success: false, error: error.message });
+          } catch (e) {
+          }
+        });
+    };
+
+    if (request.tabId && request.url && (String(request.url).includes('smartstore.naver.com') || String(request.url).includes('brand.naver.com'))) {
+      chrome.scripting.executeScript({
+        target: { tabId: request.tabId },
+        files: ['content.js']
+      }).then(() => {
+        console.log('[리뷰 수집기] [네이버 스마트스토어/브랜드스토어] content script 주입 완료, 수집 시작');
+        return new Promise(r => setTimeout(r, 400));
+      }).then(() => {
+        runStartCollection();
+      }).catch((err) => {
+        console.warn('[리뷰 수집기] [네이버 스마트스토어/브랜드스토어] content script 주입 실패:', err?.message || String(err));
+        runStartCollection();
       });
+    } else {
+      runStartCollection();
+    }
     return true;
   } else if (request.action === 'stopCollection') {
     let originalTabId = null;
@@ -283,8 +338,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     return true;
   } else if (request.action === 'progress' || request.action === 'log') {
+    // 여러 탭 병렬 처리: progress/로그는 originalTabId별 키로 격리해 속도·정확성 유지
+    const originalTabId = request.originalTabId || null;
+
     if (request.action === 'progress') {
-      const originalTabId = request.originalTabId || null;
       const storageKey = originalTabId ? `collectionProgress_${originalTabId}` : 'collectionProgress';
       chrome.storage.local.set({
         [storageKey]: {
@@ -300,7 +357,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const time = new Date().toLocaleTimeString('ko-KR');
       const logMessage = `[리뷰 수집기] ${request.message}`;
 
-      // 서비스 워커 콘솔에 출력
       if (request.type === 'error') {
         console.error(logMessage);
       } else if (request.type === 'warning') {
@@ -311,20 +367,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         console.log(logMessage);
       }
 
-      chrome.storage.local.get(['collectionLogs'], (result) => {
-        const logs = result.collectionLogs || [];
+      const logStorageKey = originalTabId ? `collectionLogs_${originalTabId}` : (sender?.tab?.id ? `collectionLogs_${sender.tab.id}` : 'collectionLogs');
+      chrome.storage.local.get([logStorageKey], (result) => {
+        const logs = result[logStorageKey] || [];
         logs.push({
           message: request.message,
           type: request.type || 'info',
           time: time,
           timestamp: Date.now()
         });
-
-        if (logs.length > 200) {
-          logs.shift();
-        }
-
-        chrome.storage.local.set({ collectionLogs: logs });
+        if (logs.length > 200) logs.shift();
+        chrome.storage.local.set({ [logStorageKey]: logs });
       });
     }
 
@@ -343,7 +396,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
     }
   } else if (request.action === 'complete') {
-    const originalTabId = request.originalTabId || null;
+    const originalTabId = request.originalTabId ?? null;
     const collection = originalTabId ? collectionsByTab.get(originalTabId) : null;
 
     if (collection) {
@@ -352,11 +405,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.storage.local.remove(storageKey);
     }
 
+    const reviews = Array.isArray(request.reviews) ? request.reviews : [];
     const collectionData = {
-      reviews: request.reviews,
+      reviews,
       timestamp: Date.now(),
-      stopped: request.stopped || false,
-      originalTabId: originalTabId
+      stopped: Boolean(request.stopped),
+      originalTabId,
+      productName: request.productName != null ? String(request.productName) : '',
+      source: request.source != null ? String(request.source) : ''
     };
 
     if (originalTabId) {
@@ -374,18 +430,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     try {
       chrome.runtime.sendMessage({
         action: 'complete',
-        reviews: request.reviews,
-        stopped: request.stopped || false,
-        originalTabId: originalTabId
-      }).catch((err) => {
-      });
+        reviews,
+        stopped: collectionData.stopped,
+        originalTabId,
+        productName: collectionData.productName,
+        source: collectionData.source
+      }).catch(() => {});
     } catch (err) {
+      // popup이 닫혀 있으면 무시
     }
 
-    // closeTab 플래그가 있으면 수집 탭 닫기
+    // closeTab 플래그가 있으면 수집 탭이 있는 창 닫기
     if (request.closeTab && collection && collection.collectionTabId) {
       try {
-        chrome.tabs.remove(collection.collectionTabId).then(() => {
+        closeWindowByTabId(collection.collectionTabId).then(() => {
           // closeTab 플래그로 닫을 때도 원래 탭으로 복귀
           if (originalTabId) {
             chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -401,7 +459,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (collection && collection.collectionTabId) {
-      // 알림만 표시하고 바로 탭 닫기 (진행률 표시 없음)
+      // 알림만 표시 (현재 탭에서 수집한 경우 창 닫기 생략)
       try {
         chrome.tabs.sendMessage(collection.collectionTabId, {
           action: 'complete',
@@ -413,20 +471,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       } catch (err) {
       }
 
-      // 알림 표시를 위한 짧은 대기 후 바로 탭 닫기
-      setTimeout(() => {
-        chrome.tabs.remove(collection.collectionTabId).then(() => {
-          // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
-          if (originalTabId) {
-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-              if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
-                chrome.tabs.update(originalTabId, { active: true }).catch(() => { });
-              }
-            });
-          }
-        }).catch(err => {
-        });
-      }, 500); // 알림 표시를 위한 최소 대기 시간 (0.5초)
+      // 새 창에서 수집한 경우에만 창 닫기 (현재 탭에서 수집한 경우 닫지 않음)
+      const isCollectionInNewWindow = collection.collectionTabId !== originalTabId;
+      if (isCollectionInNewWindow) {
+        setTimeout(() => {
+          closeWindowByTabId(collection.collectionTabId).then(() => {
+            if (originalTabId) {
+              chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+                if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
+                  chrome.tabs.update(originalTabId, { active: true }).catch(() => { });
+                }
+              });
+            }
+          }).catch(err => {
+          });
+        }, 500);
+      }
     }
   } else if (request.action === 'stopped') {
     const originalTabId = request.originalTabId || null;
@@ -438,14 +498,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.storage.local.remove(storageKey);
     }
 
-    if (request.reviews !== undefined) {
-      const collectionData = {
-        reviews: request.reviews || [],
-        timestamp: Date.now(),
-        stopped: true,
-        originalTabId: originalTabId
-      };
+    const reviews = request.reviews !== undefined && Array.isArray(request.reviews) ? request.reviews : [];
+    const collectionData = {
+      reviews,
+      timestamp: Date.now(),
+      stopped: true,
+      originalTabId,
+      productName: request.productName != null ? String(request.productName) : '',
+      source: request.source != null ? String(request.source) : ''
+    };
 
+    if (request.reviews !== undefined) {
       if (originalTabId) {
         const storageKey = `collection_${originalTabId}`;
         chrome.storage.local.set({
@@ -463,10 +526,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.runtime.sendMessage({
         action: 'stopped',
         message: request.message || '수집이 중지되었습니다.',
-        reviews: request.reviews || [],
-        originalTabId: originalTabId
-      }).catch((err) => {
-      });
+        reviews,
+        originalTabId,
+        productName: collectionData.productName,
+        source: collectionData.source
+      }).catch(() => {});
     } catch (err) {
     }
 
@@ -480,35 +544,37 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       } catch (err) {
       }
 
-      try {
-        chrome.runtime.sendMessage({
-          action: 'log',
-          message: '수집 중지. 새 창을 닫습니다...',
-          type: 'warning'
-        }).catch(() => { });
-      } catch (e) { }
+      const isCollectionInNewWindow = collection.collectionTabId !== originalTabId;
+      if (isCollectionInNewWindow) {
+        try {
+          chrome.runtime.sendMessage({
+            action: 'log',
+            message: '수집 중지. 새 창을 닫습니다...',
+            type: 'warning'
+          }).catch(() => { });
+        } catch (e) { }
 
-      setTimeout(() => {
-        chrome.tabs.remove(collection.collectionTabId).then(() => {
-          try {
-            chrome.runtime.sendMessage({
-              action: 'log',
-              message: '새 창이 닫혔습니다.',
-              type: 'success'
-            }).catch(() => { });
-          } catch (e) { }
+        setTimeout(() => {
+          closeWindowByTabId(collection.collectionTabId).then(() => {
+            try {
+              chrome.runtime.sendMessage({
+                action: 'log',
+                message: '새 창이 닫혔습니다.',
+                type: 'success'
+              }).catch(() => { });
+            } catch (e) { }
 
-          // 새 탭이 닫힐 때 현재 탭이 original tab이 아니라면 original tab으로 이동
-          if (originalTabId) {
-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-              if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
-                chrome.tabs.update(originalTabId, { active: true }).catch(() => { });
-              }
-            });
-          }
-        }).catch(err => {
-        });
-      }, 500);
+            if (originalTabId) {
+              chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+                if (tabs && tabs[0] && tabs[0].id !== originalTabId) {
+                  chrome.tabs.update(originalTabId, { active: true }).catch(() => { });
+                }
+              });
+            }
+          }).catch(err => {
+          });
+        }, 500);
+      }
     }
   } else if (request.action === 'error') {
     const originalTabId = request.originalTabId || null;
@@ -528,7 +594,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
 
       setTimeout(() => {
-        chrome.tabs.remove(collection.collectionTabId).then(() => {
+        closeWindowByTabId(collection.collectionTabId).then(() => {
           // 에러 발생 시에도 원래 탭으로 복귀
           if (originalTabId) {
             chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -613,12 +679,24 @@ async function startCollection(url, tabId, productId, ratingFilter = 'all', orig
 
   let scriptReady = false;
   let pingRetries = 10;
+  try {
+    const tabExists = await chrome.tabs.get(tabId).then(() => true).catch(() => false);
+    if (!tabExists) {
+      if (originalTabId) collectionsByTab.delete(originalTabId);
+      chrome.storage.local.remove(originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus');
+      throw new Error('수집 탭이 닫혔거나 찾을 수 없습니다.');
+    }
+  } catch (e) {
+    if (e?.message?.includes('수집 탭이')) throw e;
+    if (originalTabId) collectionsByTab.delete(originalTabId);
+    chrome.storage.local.remove(originalTabId ? `collectionStatus_${originalTabId}` : 'collectionStatus');
+    throw new Error('수집 탭을 확인할 수 없습니다: ' + (e?.message || String(e)));
+  }
+
   while (pingRetries > 0 && !scriptReady) {
     try {
-      const pingResponse = await chrome.tabs.sendMessage(tabId, {
-        action: 'ping'
-      });
-      if (pingResponse && pingResponse.success) {
+      const pingResponse = await chrome.tabs.sendMessage(tabId, { action: 'ping' });
+      if (pingResponse?.success) {
         scriptReady = true;
         break;
       }

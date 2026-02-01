@@ -9,6 +9,11 @@
   (document.head || document.documentElement).appendChild(script);
 })();
 
+// 네이버 등에서 scripting.executeScript로 재주입 시 중복 선언 방지 (IIFE로 감싸서 return 가능하게)
+(function () {
+  if (typeof window !== 'undefined' && window.__coupangReviewContentLoaded) return;
+  window.__coupangReviewContentLoaded = true;
+
 // ==================== 전역 변수 ====================
 let isScraping = false;
 let stopScraping = false;
@@ -18,6 +23,8 @@ let currentRatingFilter = 'all';
 let targetProductId = null;
 let targetUrl = null;
 let currentStage = 'idle';
+/** 수집 시작 시점에 읽어 둔 제품명 (다운로드 파일명용, 새로 고침 후에도 storage에 저장됨) */
+let cachedProductName = '';
 // CDP(debug-click)는 환경(다른 확장/보안정책)에 따라 콘솔 에러가 발생할 수 있어 기본은 끔.
 // 필요 시 true로 바꾸면 CDP click을 우선 시도합니다.
 const ENABLE_CDP_CLICK = false;
@@ -78,6 +85,73 @@ const CONSTANTS = {
   ]
 };
 
+// 사이트 감지 (content script가 주입된 페이지 기준)
+const SITE_HREF = typeof window !== 'undefined' && window.location ? (window.location.href || '') : '';
+const isCoupang = /coupang\.com/.test(SITE_HREF) && (/\/vp\/products\//.test(SITE_HREF) || /\/products\//.test(SITE_HREF));
+const isNaverSmart = /smartstore\.naver\.com/.test(SITE_HREF) && /\/products\//.test(SITE_HREF);
+const isNaverBrand = /brand\.naver\.com/.test(SITE_HREF) && /\/products\//.test(SITE_HREF);
+const isNaver = isNaverSmart || isNaverBrand;
+
+// 사이트별 셀렉터 (스마트스토어: HTT4L8U0CU/L2CTE05CX2, 브랜드스토어: JHZoCyHfg7, 공통 ul RR2FSL9wTc)
+const SITE_SELECTORS = {
+  coupang: {},
+  naver: {
+    reviewSection: 'div[class*="HTT4L8U0CU"]',
+    reviewList: 'ul[class*="RR2FSL9wTc"]',
+    reviewCard: 'ul[class*="RR2FSL9wTc"] > li, div[class*="HTT4L8U0CU"] li',
+    pagination: 'div[class*="L2CTE05CX2"]',
+    nextPage: 'div[class*="L2CTE05CX2"] a'
+  },
+  naverBrand: {
+    reviewSection: 'div[class*="JHZoCyHfg7"]',
+    reviewList: 'ul[class*="RR2FSL9wTc"]',
+    reviewCard: 'ul[class*="RR2FSL9wTc"] > li, div[class*="JHZoCyHfg7"] li',
+    rating: 'span[class*="_rvQSUB5wU"], span[class*="t7PPhhAQtT"]',
+    authorDate: 'div[class*="Db9Dtnf7gY"]',
+    author: 'strong[class*="MX91DFZo2F"]',
+    date: 'span[class*="MX91DFZo2F"]',
+    content: 'div[class*="HakaEZ240l"]',
+    contentInner: 'div[class*="KqJ8Qqw082"] span[class*="rnrf6Xo7x2"], span[class*="MX91DFZo2F"]',
+    nextPage: 'a[data-shp-area="revlist.pgn"], a[class*="JY2WGJ4hXh"]'
+  }
+};
+
+/**
+ * 현재 페이지에서 제품명 추출 (다운로드 파일명용)
+ * @returns {string}
+ */
+function getProductNameFromPage() {
+  try {
+    if (isNaver) {
+      const t = document.title || '';
+      const cleaned = t
+        .replace(/\s*[-|:]\s*네이버\s*스마트스토어\s*$/i, '')
+        .replace(/\s*[-|:]\s*NAVER\s*SMARTSTORE\s*$/i, '')
+        .replace(/\s*[-|:]\s*네이버\s*브랜드스토어\s*$/i, '')
+        .replace(/\s*[-|:]\s*NAVER\s*BRAND(STORE)?\s*$/i, '')
+        .trim();
+      if (cleaned) return cleaned.substring(0, 100);
+      return (document.title || '').substring(0, 100);
+    }
+    // 쿠팡 상품 페이지 제품명
+    const selectors = ['h1.product-title', '.product-title', '[class*="product-title"]'];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        const text = (el.innerText || el.textContent || '').trim();
+        if (text) return text.replace(/\s+/g, ' ').substring(0, 100);
+      }
+    }
+    const t = document.title || '';
+    const cleaned = t
+      .replace(/\s*[-|:]\s*쿠팡!?\s*$/i, '')
+      .replace(/\s*[-|:]\s*Coupang\s*$/i, '')
+      .trim();
+    if (cleaned) return cleaned.substring(0, 100);
+  } catch (e) { }
+  return '';
+}
+
 function sendToUI(message) {
   if (message.action === 'stopped' || message.action === 'startScraping' || message.action === 'complete') {
     try {
@@ -103,14 +177,15 @@ function actionLog(message, type = 'info') {
   safeSendMessage({
     action: 'log',
     message,
-    type
+    type,
+    originalTabId: currentOriginalTabId
   });
 }
 
 // 내부용: 비동기/예외 무시 로그 (goToNextPage 등에서 사용)
 function logToBackground(message, type = 'info') {
   try {
-    chrome.runtime.sendMessage({ action: 'log', message, type });
+    chrome.runtime.sendMessage({ action: 'log', message, type, originalTabId: currentOriginalTabId });
   } catch (e) { }
 }
 
@@ -152,7 +227,9 @@ window.addEventListener('message', (event) => {
         action: 'stopped',
         message: `수집이 중지되었습니다. (현재까지 ${finalReviews.length}개 수집됨)`,
         reviews: finalReviews,
-        originalTabId: currentOriginalTabId
+        originalTabId: currentOriginalTabId,
+        productName: cachedProductName || getProductNameFromPage(),
+        source: isCoupang ? 'coupang' : (isNaverBrand ? 'brand' : (isNaverSmart ? 'smartstore' : 'unknown'))
       }).catch(() => {
       });
     } catch (e) {
@@ -275,7 +352,8 @@ if (!window.__coupangReviewScraperLoaded) {
           sendToUI({
             action: 'complete',
             reviews: request.reviews || [],
-            stopped: request.stopped || false
+            stopped: request.stopped || false,
+            showNotificationOnly: request.showNotificationOnly
           });
         }
 
@@ -349,7 +427,9 @@ if (!window.__coupangReviewScraperLoaded) {
             action: 'stopped',
             message: `수집이 중지되었습니다. (현재까지 ${finalReviews.length}개 수집됨)`,
             reviews: finalReviews,
-            originalTabId: currentOriginalTabId
+            originalTabId: currentOriginalTabId,
+            productName: cachedProductName || getProductNameFromPage(),
+            source: isCoupang ? 'coupang' : (isNaverBrand ? 'brand' : (isNaverSmart ? 'smartstore' : 'unknown'))
           }).then(() => {
           }).catch(err => {
           });
@@ -366,6 +446,14 @@ if (!window.__coupangReviewScraperLoaded) {
             sendResponse({ success: true });
           }
           return true;
+        } else if (request.action === 'getProductName') {
+          try {
+            const name = getProductNameFromPage();
+            sendResponse({ productName: name || '' });
+          } catch (e) {
+            sendResponse({ productName: '' });
+          }
+          return true;
         }
 
         return false;
@@ -379,6 +467,9 @@ if (!window.__coupangReviewScraperLoaded) {
      * @returns {Promise<Object>}
      */
     async function startMultiFilterScraping(url, ratingFilters) {
+      if (isNaver) {
+        return startScraping(url, 'all');
+      }
       const allCollectedReviews = [];
       const ratingNames = {
         'all': '모든 별점',
@@ -408,7 +499,8 @@ if (!window.__coupangReviewScraperLoaded) {
           safeSendMessage({
             action: 'log',
             message: `올바른 상품 페이지로 이동합니다...`,
-            type: 'info'
+            type: 'info',
+            originalTabId: currentOriginalTabId
           });
           window.location.href = targetUrl;
           await waitForPageLoad();
@@ -417,10 +509,13 @@ if (!window.__coupangReviewScraperLoaded) {
 
         await waitForPageReady();
         debugLog('waitForPageReady done', { step: 'initial' }, 'H1');
+        cachedProductName = getProductNameFromPage();
+        setTimeout(() => { cachedProductName = getProductNameFromPage() || cachedProductName; }, 800);
         safeSendMessage({
           action: 'log',
           message: '리뷰 탭을 찾고 클릭합니다...',
-          type: 'info'
+          type: 'info',
+          originalTabId: currentOriginalTabId
         });
         actionLog('리뷰 탭 클릭 시도');
         await clickReviewTab();
@@ -439,7 +534,8 @@ if (!window.__coupangReviewScraperLoaded) {
           safeSendMessage({
             action: 'log',
             message: `${ratingName} 필터링 후 리뷰 수집 시작... (${i + 1}/${ratingFilters.length})`,
-            type: 'info'
+            type: 'info',
+            originalTabId: currentOriginalTabId
           });
 
           // 필터 적용
@@ -447,7 +543,8 @@ if (!window.__coupangReviewScraperLoaded) {
             safeSendMessage({
               action: 'log',
               message: `별점 필터 적용 중: ${ratingFilter}점`,
-              type: 'info'
+              type: 'info',
+              originalTabId: currentOriginalTabId
             });
             actionLog(`필터 적용 시도: ${ratingFilter}점`);
             const filterApplied = await clickRatingFilter(ratingFilter);
@@ -455,7 +552,8 @@ if (!window.__coupangReviewScraperLoaded) {
               safeSendMessage({
                 action: 'log',
                 message: `별점 필터 적용 완료: ${ratingFilter}점`,
-                type: 'success'
+                type: 'success',
+                originalTabId: currentOriginalTabId
               });
               actionLog(`필터 적용 완료: ${ratingFilter}점`);
               await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
@@ -497,7 +595,8 @@ if (!window.__coupangReviewScraperLoaded) {
           safeSendMessage({
             action: 'log',
             message: `${ratingName} 필터링 후 리뷰 수집 완료: ${reviews.length}개 (누적: ${allCollectedReviews.length}개)`,
-            type: 'success'
+            type: 'success',
+            originalTabId: currentOriginalTabId
           });
 
           // 마지막 필터가 아니면 다음 필터로 넘어가기 전 대기
@@ -510,7 +609,8 @@ if (!window.__coupangReviewScraperLoaded) {
         safeSendMessage({
           action: 'log',
           message: `모든 필터 수집 완료: 총 ${allCollectedReviews.length}개 리뷰 수집됨`,
-          type: 'success'
+          type: 'success',
+          originalTabId: currentOriginalTabId
         });
         actionLog(`멀티 필터 종료: 총 ${allCollectedReviews.length}개`);
 
@@ -527,7 +627,9 @@ if (!window.__coupangReviewScraperLoaded) {
           reviews: allCollectedReviews,
           stopped: false,
           originalTabId: currentOriginalTabId,
-          closeTab: true // 페이지 닫기 플래그
+          closeTab: true, // 페이지 닫기 플래그
+          productName: cachedProductName || getProductNameFromPage(),
+          source: isCoupang ? 'coupang' : (isNaverBrand ? 'brand' : (isNaverSmart ? 'smartstore' : 'unknown'))
         });
 
         isScraping = false;
@@ -557,7 +659,9 @@ if (!window.__coupangReviewScraperLoaded) {
             action: 'stopped',
             message: `오류 발생: ${errorMessage} (현재까지 ${allCollectedReviews.length}개 수집됨)`,
             reviews: allCollectedReviews,
-            originalTabId: currentOriginalTabId
+            originalTabId: currentOriginalTabId,
+            productName: cachedProductName || getProductNameFromPage(),
+            source: isCoupang ? 'coupang' : (isNaverBrand ? 'brand' : (isNaverSmart ? 'smartstore' : 'unknown'))
           });
         }
 
@@ -574,6 +678,7 @@ if (!window.__coupangReviewScraperLoaded) {
 
       isScraping = true;
       stopScraping = false;
+      cachedProductName = '';
       currentCollectedReviews = [];
       currentRatingFilter = ratingFilter;
       targetUrl = url.trim();
@@ -593,6 +698,8 @@ if (!window.__coupangReviewScraperLoaded) {
         setStage('startScraping enter', { url: targetUrl, rating: ratingFilter });
         await waitForPageReady();
         setStage('after waitForPageReady start', { readyState: document.readyState, url: window.location.href });
+        cachedProductName = getProductNameFromPage();
+        setTimeout(() => { cachedProductName = getProductNameFromPage() || cachedProductName; }, 800);
         actionLog(`단일 수집 시작 rating=${ratingFilter}`);
         setStage('after actionLog start', { rating: ratingFilter });
 
@@ -603,12 +710,14 @@ if (!window.__coupangReviewScraperLoaded) {
             sendMsg({
               action: 'log',
               message: `현재 URL: ${currentUrl}`,
-              type: 'info'
+              type: 'info',
+              originalTabId: currentOriginalTabId
             });
             sendMsg({
               action: 'log',
               message: `목표 URL: ${targetUrl}`,
-              type: 'info'
+              type: 'info',
+              originalTabId: currentOriginalTabId
             });
             debugLog('url info sent', { currentUrl, targetUrl }, 'H1');
             let currentProductId = null;
@@ -622,7 +731,9 @@ if (!window.__coupangReviewScraperLoaded) {
             } catch (e) {
             }
 
-            const isProductPage = currentUrl.includes('/vp/products/') || currentUrl.includes('/products/');
+            const isProductPage = isNaver
+              ? ((currentUrl.includes('smartstore.naver.com') || currentUrl.includes('brand.naver.com')) && currentUrl.includes('/products/'))
+              : (currentUrl.includes('/vp/products/') || currentUrl.includes('/products/'));
             const productIdMatches = currentProductId && targetProductId && currentProductId === targetProductId;
 
             const urlMatches = currentUrl === targetUrl ||
@@ -637,7 +748,8 @@ if (!window.__coupangReviewScraperLoaded) {
               sendMsg({
                 action: 'log',
                 message: `올바른 상품 페이지로 이동합니다... (현재 상품 ID: ${currentProductId || '없음'}, 목표 상품 ID: ${targetProductId || '없음'})`,
-                type: 'info'
+                type: 'info',
+                originalTabId: currentOriginalTabId
               });
               window.location.href = targetUrl;
               await waitForPageLoad();
@@ -649,7 +761,8 @@ if (!window.__coupangReviewScraperLoaded) {
               sendMsg({
                 action: 'log',
                 message: `이미 올바른 상품 페이지에 있습니다. (상품 ID: ${currentProductId})`,
-                type: 'info'
+                type: 'info',
+                originalTabId: currentOriginalTabId
               });
             }
           } catch (fatalBlock) {
@@ -671,7 +784,8 @@ if (!window.__coupangReviewScraperLoaded) {
         sendMsg({
           action: 'log',
           message: '리뷰 탭을 찾고 클릭합니다...',
-          type: 'info'
+          type: 'info',
+          originalTabId: currentOriginalTabId
         });
         debugLog('clickReviewTab start', { rating: ratingFilter }, 'H3');
         actionLog('리뷰 탭 클릭 시도');
@@ -690,7 +804,8 @@ if (!window.__coupangReviewScraperLoaded) {
         sendMsg({
           action: 'log',
           message: '리뷰 탭 클릭 완료',
-          type: 'success'
+          type: 'success',
+          originalTabId: currentOriginalTabId
         });
         debugLog('clickReviewTab done', { rating: ratingFilter }, 'H3');
         await waitForReviewsSection();
@@ -703,11 +818,12 @@ if (!window.__coupangReviewScraperLoaded) {
           throw new Error('수집이 중지되었습니다.');
         }
 
-        if (ratingFilter && ratingFilter !== 'all') {
+        if (!isNaver && ratingFilter && ratingFilter !== 'all') {
           sendMsg({
             action: 'log',
             message: `별점 필터 적용 중: ${ratingFilter}점`,
-            type: 'info'
+            type: 'info',
+            originalTabId: currentOriginalTabId
           });
           actionLog(`필터 적용 시도: ${ratingFilter}점`);
           debugLog('filter apply start', { rating: ratingFilter }, 'H4');
@@ -717,7 +833,8 @@ if (!window.__coupangReviewScraperLoaded) {
               sendMsg({
                 action: 'log',
                 message: `별점 필터 적용 완료: ${ratingFilter}점 - 필터링된 리뷰만 수집합니다.`,
-                type: 'success'
+                type: 'success',
+                originalTabId: currentOriginalTabId
               });
               actionLog(`필터 적용 완료: ${ratingFilter}점`);
               debugLog('filter apply done', { rating: ratingFilter }, 'H4');
@@ -730,7 +847,8 @@ if (!window.__coupangReviewScraperLoaded) {
               sendMsg({
                 action: 'log',
                 message: '별점 필터를 찾을 수 없습니다. 모든 리뷰를 수집합니다.',
-                type: 'warning'
+                type: 'warning',
+                originalTabId: currentOriginalTabId
               });
             }
           } catch (errFilter) {
@@ -749,7 +867,8 @@ if (!window.__coupangReviewScraperLoaded) {
         sendMsg({
           action: 'log',
           message: '리뷰 수집을 시작합니다...',
-          type: 'info'
+          type: 'info',
+          originalTabId: currentOriginalTabId
         });
         sendMsg({
           action: 'progress',
@@ -765,7 +884,8 @@ if (!window.__coupangReviewScraperLoaded) {
         sendMsg({
           action: 'log',
           message: `리뷰 수집 완료: 총 ${allReviews.length}개 리뷰 수집됨`,
-          type: 'success'
+          type: 'success',
+          originalTabId: currentOriginalTabId
         });
         if (allReviews.length === 0) {
           const errorMsg = '리뷰를 찾을 수 없습니다. 리뷰 추출을 종료합니다.';
@@ -784,7 +904,9 @@ if (!window.__coupangReviewScraperLoaded) {
             action: 'stopped',
             message: errorMsg,
             reviews: [],
-            originalTabId: currentOriginalTabId
+            originalTabId: currentOriginalTabId,
+            productName: cachedProductName || getProductNameFromPage(),
+            source: isCoupang ? 'coupang' : (isNaverBrand ? 'brand' : (isNaverSmart ? 'smartstore' : 'unknown'))
           }).then(() => {
           }).catch(err => {
           });
@@ -801,7 +923,9 @@ if (!window.__coupangReviewScraperLoaded) {
             action: 'stopped',
             message: `수집이 중지되었습니다. (현재까지 ${allReviews.length}개 수집됨)`,
             reviews: allReviews,
-            originalTabId: currentOriginalTabId
+            originalTabId: currentOriginalTabId,
+            productName: cachedProductName || getProductNameFromPage(),
+            source: isCoupang ? 'coupang' : (isNaverBrand ? 'brand' : (isNaverSmart ? 'smartstore' : 'unknown'))
           });
         } else {
           // 프로그레스바를 100%로 업데이트
@@ -816,7 +940,9 @@ if (!window.__coupangReviewScraperLoaded) {
             action: 'complete',
             reviews: allReviews,
             stopped: false,
-            originalTabId: currentOriginalTabId
+            originalTabId: currentOriginalTabId,
+            productName: cachedProductName || getProductNameFromPage(),
+            source: isCoupang ? 'coupang' : (isNaverBrand ? 'brand' : (isNaverSmart ? 'smartstore' : 'unknown'))
           });
         }
 
@@ -927,6 +1053,56 @@ if (!window.__coupangReviewScraperLoaded) {
           return;
         }
 
+        if (isNaver) {
+          const sectionSel = isNaverBrand ? 'div[class*="JHZoCyHfg7"]' : 'div[class*="HTT4L8U0CU"]';
+          const naverReviewEl = document.querySelector(sectionSel) || document.querySelector('ul[class*="RR2FSL9wTc"]');
+          if (naverReviewEl) {
+            resolve();
+            return;
+          }
+          let observer = null;
+          const maxWaitTime = CONSTANTS.WAIT_TIMES.REVIEWS_SECTION;
+          const checkInterval = 50;
+          const startTime = Date.now();
+          const cleanup = () => {
+            if (observer) {
+              observer.disconnect();
+              observer = null;
+            }
+          };
+          const checkSection = () => {
+            if (stopScraping) {
+              cleanup();
+              resolve();
+              return;
+            }
+            const el = document.querySelector(sectionSel) || document.querySelector('ul[class*="RR2FSL9wTc"]');
+            if (el) {
+              cleanup();
+              setTimeout(() => resolve(), CONSTANTS.WAIT_TIMES.LONG);
+              return;
+            }
+            if (Date.now() - startTime >= maxWaitTime) {
+              cleanup();
+              resolve();
+              return;
+            }
+          };
+          if (document.body) {
+            observer = new MutationObserver(checkSection);
+            observer.observe(document.body, { childList: true, subtree: true });
+          }
+          const interval = setInterval(() => {
+            checkSection();
+            if (Date.now() - startTime >= maxWaitTime) {
+              clearInterval(interval);
+              cleanup();
+              resolve();
+            }
+          }, checkInterval);
+          return;
+        }
+
         const sdpReview = safeQuerySelector('#sdpReview');
         if (sdpReview && sdpReview.children.length > 0) {
           resolve();
@@ -993,7 +1169,47 @@ if (!window.__coupangReviewScraperLoaded) {
           resolve();
           return;
         }
-
+        if (isNaver) {
+          (async () => {
+            try {
+              const reviewTabSelectors = [
+                'li a[data-name="REVIEW"]',
+                'li.yg0fOdRhWZ a',
+                'a[data-shp-area="tab.select"][data-name="REVIEW"]',
+                'li[role="presentation"] a[href="#"]'
+              ];
+              let reviewTab = null;
+              for (const sel of reviewTabSelectors) {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                  const text = (el.textContent || '').trim();
+                  if (text === '리뷰' && el.offsetParent !== null) {
+                    reviewTab = el;
+                    break;
+                  }
+                }
+                if (reviewTab) break;
+              }
+              if (!reviewTab) {
+                const allLinks = document.querySelectorAll('li a, a[href="#"]');
+                for (const a of allLinks) {
+                  const text = (a.textContent || '').trim();
+                  if (text === '리뷰' && a.offsetParent !== null) {
+                    reviewTab = a;
+                    break;
+                  }
+                }
+              }
+              if (reviewTab) {
+                reviewTab.click();
+                await sleep(500);
+                await new Promise(r => setTimeout(r, 500));
+              }
+            } catch (e) { }
+            resolve();
+          })();
+          return;
+        }
         try {
           if (!document.body) {
             setTimeout(() => {
@@ -1359,10 +1575,160 @@ if (!window.__coupangReviewScraperLoaded) {
       });
     }
 
+    async function goToNextPageNaver() {
+      try {
+        if (isNaverBrand) {
+          const paginationContainer = document.querySelector('div[class*="LiT9lKOVbw"][class*="q0sLM3XjRQ"]') ||
+            document.querySelector('div[class*="LiT9lKOVbw"]');
+          if (!paginationContainer) return false;
+          const pageButtonCandidates = Array.from(paginationContainer.querySelectorAll('a[class*="hyY6CXtbcn"], div[class*="hyY6CXtbcn"]')).filter(el => {
+            if (!el || el.offsetParent === null) return false;
+            const text = (el.textContent || '').trim();
+            return /^\d+$/.test(text);
+          });
+          const pageButtons = pageButtonCandidates.length > 0 ? pageButtonCandidates : Array.from(paginationContainer.querySelectorAll('[class*="hyY6CXtbcn"]')).filter(el => {
+            if (!el || el.offsetParent === null) return false;
+            const text = (el.textContent || '').trim();
+            return /^\d+$/.test(text);
+          });
+          pageButtons.sort((a, b) => {
+            const numA = parseInt((a.textContent || '').trim(), 10);
+            const numB = parseInt((b.textContent || '').trim(), 10);
+            return (numA - numB);
+          });
+          let toClick = null;
+          let currentIndex = -1;
+          for (let i = 0; i < pageButtons.length; i++) {
+            const btn = pageButtons[i];
+            const isCurrent = btn.getAttribute('aria-current') === 'true' || btn.getAttribute('aria-current') === 'page' ||
+              (btn.classList && (btn.classList.contains('active') || btn.getAttribute('aria-selected') === 'true'));
+            if (isCurrent) {
+              currentIndex = i;
+              break;
+            }
+          }
+          if (currentIndex < 0 && pageButtons.length > 0) {
+            currentIndex = 0;
+          }
+          if (currentIndex >= 0 && currentIndex < pageButtons.length - 1) {
+            toClick = pageButtons[currentIndex + 1];
+          }
+          if (!toClick) {
+            const nextBtn = paginationContainer.querySelector('a[class*="JY2WGJ4hXh"][class*="I3i1NSoFdB"]') ||
+              paginationContainer.querySelector('div[class*="JY2WGJ4hXh"][class*="I3i1NSoFdB"]') ||
+              document.querySelector('a[class*="JY2WGJ4hXh"][class*="I3i1NSoFdB"]') ||
+              document.querySelector('div[class*="JY2WGJ4hXh"][class*="I3i1NSoFdB"]');
+            if (nextBtn && nextBtn.offsetParent !== null && nextBtn.getAttribute('aria-hidden') !== 'true' && !nextBtn.disabled) {
+              toClick = nextBtn;
+            }
+          }
+          if (!toClick) return false;
+          try {
+            toClick.scrollIntoView({ block: 'center', behavior: 'instant' });
+          } catch (_) {}
+          await sleep(CONSTANTS.WAIT_TIMES.SHORT);
+          toClick.click();
+          await sleep(CONSTANTS.WAIT_TIMES.LONG);
+          await waitForPageReady();
+          await waitForReviewsSection();
+          await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+          return true;
+        }
+
+        const paginationEl = document.querySelector('div[class*="L2CTE05CX2"]');
+        const searchRoot = paginationEl || document;
+        let nextLink = null;
+        const links = searchRoot.querySelectorAll('a[href="#"], a[data-shp-area="revlist.pgn"], a');
+        for (const a of links) {
+          const text = (a.textContent || '').trim();
+          if (text === '다음' && a.offsetParent !== null && a.getAttribute('aria-hidden') !== 'true' && !a.disabled) {
+            nextLink = a;
+            break;
+          }
+        }
+        if (!nextLink && searchRoot.querySelectorAll) {
+          const allLinks = Array.from(searchRoot.querySelectorAll('a'));
+          for (const a of allLinks) {
+            const text = (a.textContent || '').trim();
+            if (text === '다음' && a.offsetParent !== null && a.getAttribute('aria-hidden') !== 'true') {
+              nextLink = a;
+              break;
+            }
+          }
+        }
+        if (!nextLink || nextLink.disabled) return false;
+        nextLink.click();
+        await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+        await waitForPageReady();
+        await waitForReviewsSection();
+        await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
     async function collectAllReviews() {
       const allReviews = [];
       debugLog('collectAllReviews start', { rating: currentRatingFilter }, 'H2');
       currentCollectedReviews = allReviews;
+
+      if (isNaver) {
+        safeSendMessage({
+          action: 'progress',
+          percent: 10,
+          text: '첫 페이지 리뷰 추출 중... (네이버)',
+          originalTabId: currentOriginalTabId
+        });
+        let pageReviews = await extractReviewsFromPage();
+        for (const r of pageReviews) {
+          if (stopScraping) break;
+          const safe = {
+            content: r.content != null ? String(r.content) : '',
+            title: r.title != null ? String(r.title) : '',
+            rating: r.rating != null ? String(r.rating) : '',
+            date: r.date != null ? String(r.date) : '',
+            author: r.author != null ? String(r.author) : '',
+            productEvaluation: r.productEvaluation != null ? String(r.productEvaluation) : '',
+            originalTabId: r.originalTabId != null ? r.originalTabId : currentOriginalTabId
+          };
+          if (!isDuplicateReview(safe, allReviews)) allReviews.push(safe);
+        }
+        currentCollectedReviews = [...allReviews];
+        let pageNum = 1;
+        while (!stopScraping && (await goToNextPageNaver())) {
+          pageNum++;
+          safeSendMessage({
+            action: 'progress',
+            percent: Math.min(90, 15 + pageNum * 5),
+            text: `${allReviews.length}개 리뷰 수집 중... (네이버 페이지 ${pageNum})`,
+            originalTabId: currentOriginalTabId
+          });
+          pageReviews = await extractReviewsFromPage();
+          for (const r of pageReviews) {
+            if (stopScraping) break;
+            const safe = {
+              content: r.content != null ? String(r.content) : '',
+              title: r.title != null ? String(r.title) : '',
+              rating: r.rating != null ? String(r.rating) : '',
+              date: r.date != null ? String(r.date) : '',
+              author: r.author != null ? String(r.author) : '',
+              productEvaluation: r.productEvaluation != null ? String(r.productEvaluation) : '',
+              originalTabId: r.originalTabId != null ? r.originalTabId : currentOriginalTabId
+            };
+            if (!isDuplicateReview(safe, allReviews)) allReviews.push(safe);
+          }
+          currentCollectedReviews = [...allReviews];
+        }
+        safeSendMessage({
+          action: 'progress',
+          percent: 100,
+          text: `수집 완료: 총 ${allReviews.length}개 리뷰`,
+          originalTabId: currentOriginalTabId
+        });
+        return allReviews;
+      }
+
       let logicalPage = 1; // 논리적 페이지(우리가 추적), DOM 페이지와 분리
       let hasNoReviewsMessage = false;
       const visitedPageSignatures = new Set(); // 중복 페이지 방지 (article 요소 기반 + rating)
@@ -1941,7 +2307,9 @@ if (!window.__coupangReviewScraperLoaded) {
             action: 'stopped',
             message: '리뷰를 찾지 못했습니다. 리뷰 추출을 종료합니다.',
             reviews: [],
-            originalTabId: currentOriginalTabId
+            originalTabId: currentOriginalTabId,
+            productName: cachedProductName || getProductNameFromPage(),
+            source: isCoupang ? 'coupang' : (isNaverBrand ? 'brand' : (isNaverSmart ? 'smartstore' : 'unknown'))
           });
         }
       }
@@ -1957,6 +2325,48 @@ if (!window.__coupangReviewScraperLoaded) {
       const reviews = [];
       try {
         if (stopScraping) {
+          return reviews;
+        }
+
+        if (isNaver) {
+          await sleep(CONSTANTS.WAIT_TIMES.SHORT);
+          await waitForReviewsSection();
+          const sectionClass = isNaverBrand ? 'JHZoCyHfg7' : 'HTT4L8U0CU';
+          const listEl = document.querySelector('ul[class*="RR2FSL9wTc"]');
+          let reviewElements = [];
+          if (listEl) {
+            reviewElements = Array.from(listEl.querySelectorAll(':scope > li')).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
+          }
+          if (reviewElements.length === 0) {
+            const sectionEl = document.querySelector(`div[class*="${sectionClass}"]`);
+            if (sectionEl) {
+              const lis = sectionEl.querySelectorAll('ul[class*="RR2FSL9wTc"] li, li');
+              reviewElements = Array.from(lis).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
+            }
+          }
+          if (reviewElements.length === 0) {
+            const fallback = document.querySelectorAll(`div[class*="${sectionClass}"] li, ul[class*="RR2FSL9wTc"] li`);
+            reviewElements = Array.from(fallback).filter(el => el && el.nodeType === Node.ELEMENT_NODE);
+          }
+          for (const element of reviewElements) {
+            if (stopScraping) break;
+            if (!element || element.nodeType !== Node.ELEMENT_NODE) continue;
+            const review = extractReviewData(element);
+            if (review) {
+              const safe = {
+                content: review.content != null ? String(review.content) : '',
+                title: review.title != null ? String(review.title) : '',
+                rating: review.rating != null ? String(review.rating) : '',
+                date: review.date != null ? String(review.date) : '',
+                author: review.author != null ? String(review.author) : '',
+                productEvaluation: review.productEvaluation != null ? String(review.productEvaluation) : '',
+                originalTabId: review.originalTabId != null ? review.originalTabId : currentOriginalTabId
+              };
+              if (safe.content || safe.author || safe.date || safe.rating) {
+                reviews.push(safe);
+              }
+            }
+          }
           return reviews;
         }
 
@@ -2236,7 +2646,16 @@ if (!window.__coupangReviewScraperLoaded) {
                 } else {
                   review.content = review.content || '';
                 }
-                reviews.push(review);
+                const safe = {
+                  content: review.content != null ? String(review.content) : '',
+                  title: review.title != null ? String(review.title) : '',
+                  rating: review.rating != null ? String(review.rating) : '',
+                  date: review.date != null ? String(review.date) : '',
+                  author: review.author != null ? String(review.author) : '',
+                  productEvaluation: review.productEvaluation != null ? String(review.productEvaluation) : '',
+                  originalTabId: review.originalTabId != null ? review.originalTabId : currentOriginalTabId
+                };
+                reviews.push(safe);
               } else {
                 // 사용자 요청: 리뷰 단위 로그는 제외 (추출 실패도 조용히 스킵)
               }
@@ -2306,6 +2725,89 @@ if (!window.__coupangReviewScraperLoaded) {
       let date = '';
       let author = '';
       let productEvaluation = '';
+
+      if (isNaver) {
+        try {
+          if (isNaverBrand) {
+            const ratingWrap = element.querySelector('span[class*="_rvQSUB5wU"]');
+            if (ratingWrap) {
+              const inner = ratingWrap.querySelector('span[class*="t7PPhhAQtT"]');
+              const w = (inner && inner.style && inner.style.width) ? inner.style.width : '';
+              const pct = parseInt(w, 10);
+              if (!isNaN(pct) && pct >= 20 && pct <= 100) rating = String(Math.round(pct / 20));
+            }
+            const authorDateDiv = element.querySelector('div[class*="Db9Dtnf7gY"]');
+            if (authorDateDiv) {
+              const strongEl = authorDateDiv.querySelector('strong[class*="MX91DFZo2F"]');
+              if (strongEl) author = (strongEl.textContent || '').trim();
+              const dateSpans = authorDateDiv.querySelectorAll('span[class*="MX91DFZo2F"]');
+              for (const span of dateSpans) {
+                const t = (span.textContent || '').trim();
+                const m = t.match(/^(\d{2})\.(\d{2})\.(\d{2})\.?$/);
+                if (m) {
+                  const y = parseInt(m[1], 10) >= 50 ? '19' + m[1] : '20' + m[1];
+                  date = `${y}-${m[2]}-${m[3]}`;
+                  break;
+                }
+                if (/^\d{4}[.\-]\d{1,2}[.\-]\d{1,2}/.test(t)) {
+                  date = t.replace(/\s+/g, ' ').trim().substring(0, 20);
+                  break;
+                }
+              }
+            }
+            const contentDiv = element.querySelector('div[class*="HakaEZ240l"]');
+            if (contentDiv) {
+              const parts = [];
+              const innerSpans = contentDiv.querySelectorAll('span[class*="rnrf6Xo7x2"], span[class*="MX91DFZo2F"]');
+              for (const s of innerSpans) {
+                const t = (s.textContent || '').trim();
+                if (t) parts.push(t);
+              }
+              content = parts.join(' ').trim() || (contentDiv.textContent || '').trim();
+            }
+          } else {
+            const ratingEl = element.querySelector('em') || element.querySelector('[class*="rating"]');
+            if (ratingEl) {
+              const rText = (ratingEl.textContent || '').trim().replace(/\D/g, '');
+              if (/^[1-5]$/.test(rText)) rating = rText;
+            }
+            const authorEl = element.querySelector('strong') || element.querySelector('b');
+            if (authorEl) author = (authorEl.textContent || '').trim();
+            const allSpans = element.querySelectorAll('span');
+            for (const span of allSpans) {
+              const t = (span.textContent || '').trim();
+              if (/^\d{4}[.\-]\d{1,2}[.\-]\d{1,2}$/.test(t) || /^\d{4}[.\-]\d{1,2}[.\-]\d{1,2}\s/.test(t)) {
+                date = t.replace(/\s+/g, ' ').trim().substring(0, 20);
+                break;
+              }
+            }
+            const contentDiv = element.querySelector('div[class*="HakaEZ240l"]');
+            if (contentDiv) {
+              const spans = contentDiv.querySelectorAll('span[class*="MX91DFZo2F"]');
+              const parts = [];
+              for (const s of spans) {
+                const t = (s.textContent || '').trim();
+                if (t) parts.push(t);
+              }
+              content = parts.join(' ').trim() || (contentDiv.textContent || '').trim();
+            }
+            if (!content) {
+              content = (element.textContent || '').trim().replace(/\s+/g, ' ').trim();
+            }
+          }
+          return {
+            date: date || '',
+            author: author || '',
+            rating: rating || '',
+            title: title || '',
+            content: content || '',
+            productEvaluation: productEvaluation || '',
+            originalTabId: currentOriginalTabId
+          };
+        } catch (e) {
+          return null;
+        }
+      }
 
       try {
         // 1. 날짜 추출
@@ -2694,22 +3196,24 @@ if (!window.__coupangReviewScraperLoaded) {
     }
 
     function isDuplicateReview(review, existingReviews) {
-      // content, date, author를 조합하여 고유성 확인 (작성자가 다르면 다른 리뷰로 처리)
-      const reviewContent = (review.content || '').trim();
-      const reviewDate = (review.date || '').trim();
+      // 별점, 작성자, 날짜, 리뷰 내용이 모두 같을 때만 중복으로 처리
+      const reviewRating = (review.rating || '').trim();
       const reviewAuthor = (review.author || '').trim();
-      const reviewKey = `${reviewContent}_${reviewDate}_${reviewAuthor}`;
+      const reviewDate = (review.date || '').trim();
+      const reviewContent = (review.content || '').trim();
 
       const duplicateIndex = existingReviews.findIndex(existing => {
-        const existingContent = (existing.content || '').trim();
-        const existingDate = (existing.date || '').trim();
+        const existingRating = (existing.rating || '').trim();
         const existingAuthor = (existing.author || '').trim();
-        const existingKey = `${existingContent}_${existingDate}_${existingAuthor}`;
-        return existingKey === reviewKey;
+        const existingDate = (existing.date || '').trim();
+        const existingContent = (existing.content || '').trim();
+        return existingRating === reviewRating &&
+          existingAuthor === reviewAuthor &&
+          existingDate === reviewDate &&
+          existingContent === reviewContent;
       });
 
       if (duplicateIndex !== -1) {
-        // 중복 발견: 기존 리뷰는 유지하고 중복 여부만 반환
         return true; // 중복임을 표시
       }
 
@@ -2805,6 +3309,35 @@ if (!window.__coupangReviewScraperLoaded) {
 
     async function goToNextPage(buttonIndex, checkOnly = false) {
       logToBackground(`goToNextPage 진입: buttonIndex=${buttonIndex}, checkOnly=${checkOnly}`, 'info');
+
+      // 맨 마지막 페이지: 다음 페이지(화살표) 버튼이 disabled 또는 twc-cursor-not-allowed 이면 수집 종료
+      if (buttonIndex === 12) {
+        try {
+          const pageInfo = getPaginationInfo();
+          const container =
+            pageInfo.container ||
+            document.querySelector('#sdpReview div[data-page]') ||
+            document.querySelector('#sdpReview div.twc-overflow-hidden div:nth-child(5) > div') ||
+            document.querySelector('#sdpReview div.twc-overflow-hidden') ||
+            document.querySelector('#sdpReview');
+          const buttons = container ? Array.from(container.querySelectorAll('button, a')) : [];
+          for (const btn of buttons) {
+            const hasArrow = btn.querySelector && btn.querySelector('svg');
+            const isPrevArrow = btn.querySelector && btn.querySelector('svg.twc-rotate-\\[180deg\\]');
+            if (hasArrow && !isPrevArrow) {
+              const isLastPage =
+                btn.disabled === true ||
+                (btn.getAttribute && btn.getAttribute('disabled') !== null) ||
+                (btn.classList && btn.classList.contains('twc-cursor-not-allowed'));
+              if (isLastPage) {
+                logToBackground('goToNextPage: 마지막 페이지(다음 버튼 비활성) → 수집 종료', 'info');
+                return false;
+              }
+              break;
+            }
+          }
+        } catch (e) { }
+      }
 
       // 이미 목표 페이지(라벨)인 경우에는 다시 클릭하지 않음 (재시도 루프에서 페이지가 밀리는 현상 방지)
       try {
@@ -2942,6 +3475,25 @@ if (!window.__coupangReviewScraperLoaded) {
           } catch (e) {
           }
           if (!checkOnly) {
+            // 다음 페이지(화살표) 이동 전에 해당 줄의 첫 번째 요소(현재 페이지 버튼 등)를 먼저 클릭
+            if (buttonIndex === 12) {
+              const pageInfo = getPaginationInfo();
+              const rowContainer =
+                pageInfo.container ||
+                document.querySelector('#sdpReview div[data-page]') ||
+                document.querySelector('#sdpReview div.twc-overflow-hidden div:nth-child(5) > div') ||
+                document.querySelector('#sdpReview div.twc-overflow-hidden') ||
+                document.querySelector('#sdpReview');
+              const firstInRow = rowContainer?.firstElementChild;
+              if (firstInRow && firstInRow !== btn && (firstInRow.tagName === 'BUTTON' || firstInRow.tagName === 'A')) {
+                try {
+                  firstInRow.scrollIntoView({ block: 'center', behavior: 'instant' });
+                  await sleep(CONSTANTS.WAIT_TIMES.SHORT);
+                  firstInRow.click();
+                  await sleep(CONSTANTS.WAIT_TIMES.MEDIUM);
+                } catch (e) { }
+              }
+            }
             // 쿠팡은 합성 클릭을 무시할 수 있어 background의 chrome.debugger로 "진짜 클릭"을 주입
             try {
               if (cdpClickDisabled) {
@@ -3301,3 +3853,5 @@ if (!window.__coupangReviewScraperLoaded) {
 
   })();
 }
+
+})();
